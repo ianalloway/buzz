@@ -53,7 +53,15 @@ with a TypeScript lookup table or an id comparison in a component.
 6. **One canonical behavior, disclosure presets for visibility.** Behavior
    flags were deliberately killed in #2148 (`CANONICAL_CONFIG_BEHAVIORS`).
    Surface differences are expressed via the `disclosure` preset, not new
-   boolean props.
+   boolean props.  **Exception:** `onboarding-essential` hides happy-path
+   helper copy (provider/model descriptions) but a non-null model-discovery
+   status always bypasses the preset and renders the status line — enforced
+   via `shouldShowModelStatusMessage()` (`AgentConfigFields.tsx`).
+   Additionally, a successful discovery response that yields no usable options
+   (`supportsSwitching:false` or empty model list) synthesizes a warning status
+   via `synthesizeEmptyDiscoveryStatus()` and is intentionally **not cached**
+   so that closing → reopening the dialog re-runs discovery after the user
+   installs or signs into the CLI (`isCacheableDiscoveryResponse()`).
 7. **Onboarding does not change.** `onboarding-agent-defaults.spec.ts` is the
    acceptance gate for anything touching the shared renderer.
 
@@ -62,7 +70,11 @@ with a TypeScript lookup table or an id comparison in a component.
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing
   policy. Update when the capability model changes.
 - `ui/agentConfigFieldsContract.test.mjs` — canonical behaviors + disclosure
-  presets. If this fails, you probably reintroduced a per-surface flag.
+  presets + `shouldShowModelStatusMessage` status-bypass rule. If this fails,
+  you probably reintroduced a per-surface flag or broke the status-bypass.
+- `ui/usePersonaModelDiscovery.test.mjs` — `synthesizeEmptyDiscoveryStatus`,
+  `isCacheableDiscoveryResponse`, `deriveModelDiscoveryPending`. If the
+  "reopen to retry" copy becomes inert again, these tests will catch it.
 - `desktop/tests/e2e/onboarding-agent-defaults.spec.ts` — onboarding behavior
   pin (35 tests).
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
