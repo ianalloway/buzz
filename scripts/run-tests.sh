@@ -93,6 +93,14 @@ run_unit_tests() {
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
 
+  # buzz-audit hash-chain unit tests. The Postgres-backed chain tests are
+  # #[ignore]d, so --lib keeps this step infra-free while still covering digest
+  # determinism, tenant binding, and the guard that the hashed `created_at` is
+  # already at the microsecond precision Postgres stores. Before this step the
+  # crate ran in neither mode, so a broken audit round-trip shipped green.
+  run_test_step "buzz-audit unit tests" \
+    cargo test -p buzz-audit --lib -- --nocapture
+
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
   run_test_step "buzz-conformance tests" \

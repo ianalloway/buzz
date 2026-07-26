@@ -275,6 +275,13 @@ test-unit:
         # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
         # stray file in migrations/ or a broken lint ships green.
         cargo nextest run -p buzz-db --lib
+        # buzz-audit hash-chain tests. The Postgres-backed chain tests are
+        # #[ignore]d, so --lib runs only the infra-free set: digest determinism,
+        # tenant binding, canonical-JSON ordering, and the guard that the hashed
+        # `created_at` is already at Postgres microsecond precision. Until this
+        # step existed the crate ran in neither the unit nor the integration
+        # path, which is how a broken audit round-trip shipped green.
+        cargo nextest run -p buzz-audit --lib
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
         # replay — so it belongs in the unit job. Run all targets (lib + the
