@@ -24,10 +24,19 @@ pub const MAX_WILDCARDS_PER_PATTERN: usize = 3;
 
 /// A validated ref pattern for matching git refs.
 ///
-/// Grammar: `segment ("/" segment)*` where segment is either a literal
-/// `[a-zA-Z0-9._-]+` or `*` (matches exactly one path segment).
+/// Grammar: `segment ("/" segment)*` where segment is one of:
+/// - a literal `[a-zA-Z0-9._-]+`;
+/// - `*` — matches exactly one path segment;
+/// - `**` — matches one *or more* trailing segments, and must be the last
+///   segment ([`RefPattern::parse`] rejects it anywhere else).
 ///
-/// Patterns MUST start with `refs/`. No `**`, `?`, `[...]`, or partial globs.
+/// Patterns MUST start with `refs/` and carry at most
+/// [`MAX_WILDCARDS_PER_PATTERN`] wildcard segments. No `?`, `[...]`, or partial
+/// globs (`v*`).
+///
+/// Note that `*` does **not** cross `/`, so `refs/heads/*` covers
+/// `refs/heads/main` but not `refs/heads/feature/foo` — a protection rule meant
+/// to cover nested branches needs `refs/heads/**`. See [`RefPattern::matches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefPattern {
     /// The original pattern string (e.g., "refs/heads/*").
@@ -842,6 +851,31 @@ mod tests {
         };
         // no-force-push should NOT block fast-forward pushes.
         assert!(evaluate_ref_update(&update, MemberRole::Member, &rules).is_ok());
+    }
+
+    #[test]
+    fn single_wildcard_rule_does_not_reach_nested_branches() {
+        // `*` does not cross `/`, so a rule written `refs/heads/*` protects
+        // `refs/heads/main` but NOT `refs/heads/feature/foo` — the nested ref
+        // has no explicit match and falls through to the built-in defaults,
+        // where a Member may fast-forward it. This is the practical trap the
+        // RefPattern docs warn about; `refs/heads/**` is the fix.
+        let rules =
+            vec![parse_protection_tag(&["refs/heads/*", "push:admin", "no-force-push"]).unwrap()];
+        let nested = RefUpdate {
+            ref_name: "refs/heads/feature/foo".to_string(),
+            kind: UpdateKind::FastForward,
+            old_oid: "a".repeat(40),
+            new_oid: "b".repeat(40),
+        };
+        assert!(!EffectiveRules::for_ref(&nested.ref_name, &rules).has_explicit_match);
+        assert!(evaluate_ref_update(&nested, MemberRole::Member, &rules).is_ok());
+
+        // The same rule written recursively does cover the nested ref.
+        let recursive =
+            vec![parse_protection_tag(&["refs/heads/**", "push:admin", "no-force-push"]).unwrap()];
+        assert!(EffectiveRules::for_ref(&nested.ref_name, &recursive).has_explicit_match);
+        assert!(evaluate_ref_update(&nested, MemberRole::Member, &recursive).is_err());
     }
 
     #[test]
