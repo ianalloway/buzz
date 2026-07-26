@@ -70,14 +70,17 @@ pub fn encrypt_observer_payload<T: Serialize>(
         });
     }
 
+    // Zeroize before `?` propagates: an encryption failure must not leave the
+    // serialized payload sitting in the buffer, which is the one path where
+    // this function used to skip the wipe every other path performs.
     let encrypted = nip44::encrypt(
         sender_keys.secret_key(),
         recipient,
         &plaintext,
         nip44::Version::V2,
-    )?;
+    );
     plaintext.zeroize();
-    Ok(encrypted)
+    Ok(encrypted?)
 }
 
 /// NIP-44 decrypt and deserialize an observer payload from `event`.
