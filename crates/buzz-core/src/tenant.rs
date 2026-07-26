@@ -114,27 +114,55 @@ impl TenantContext {
 ///   since a deployment may legitimately serve different communities on
 ///   different ports of the same name.
 ///
+/// The port is split off *before* the FQDN-root dot is stripped, so the two
+/// rules compose in either order of appearance: `relay.example.` and
+/// `relay.example.:8443` normalize to the same host as `relay.example` and
+/// `relay.example:8443` respectively. Stripping the dot only when it happened
+/// to be the final byte would leave the trailing-dot-plus-non-default-port
+/// spelling as its own tenant.
+///
 /// The input is trimmed of surrounding whitespace. An empty result (e.g. the
 /// caller passed `""`) is returned as-is; resolution treats an empty or
 /// unmapped host as a fail-closed rejection, never a default tenant.
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
-    let host = host.trim();
-    let mut host = host.to_ascii_lowercase();
-    // Strip default ports. We only touch a `:port` suffix that is exactly a
-    // default port, so IPv6 literals like `[::1]` (which contain colons but no
-    // trailing `:80`/`:443`) are left intact.
-    if let Some(stripped) = host
-        .strip_suffix(":443")
-        .or_else(|| host.strip_suffix(":80"))
-    {
-        host = stripped.to_string();
-    }
+    let mut host = host.trim().to_ascii_lowercase();
+    let port = split_port(&mut host);
+
     // Strip a single trailing FQDN-root dot.
-    if let Some(stripped) = host.strip_suffix('.') {
-        host = stripped.to_string();
+    if host.ends_with('.') {
+        host.truncate(host.len() - 1);
     }
-    host
+
+    // Re-attach the port unless it is a scheme default.
+    match port.as_deref() {
+        None | Some("80") | Some("443") => host,
+        Some(port) => {
+            host.push(':');
+            host.push_str(port);
+            host
+        }
+    }
+}
+
+/// Split a trailing `:port` off `host` in place, returning the port digits.
+///
+/// IPv6 literals are bracketed (`[::1]`, `[::1]:3000`), so a colon delimits a
+/// port only when it sits after the closing bracket — that is what keeps a bare
+/// `[::1]` intact despite containing colons. For names, only the final colon can
+/// start a port, and only when everything after it is ASCII digits.
+fn split_port(host: &mut String) -> Option<String> {
+    let colon = host.rfind(':')?;
+    if host.rfind(']').is_some_and(|close| close > colon) {
+        return None;
+    }
+    let digits = &host[colon + 1..];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = digits.to_string();
+    host.truncate(colon);
+    Some(port)
 }
 
 /// Extract the authority (host plus an explicit non-default port, if present)
@@ -219,10 +247,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_collapses_fqdn_dot_under_a_nondefault_port() {
+        // The FQDN-root dot and the port are independent spellings, so every
+        // combination of them is the SAME tenant. Stripping the dot only when it
+        // is the final byte missed the dot-plus-non-default-port form, splitting
+        // `relay.example.:8443` off as its own community.
+        let canonical = "relay.example:8443";
+        for variant in [
+            "relay.example:8443",
+            "relay.example.:8443",
+            "Relay.Example.:8443",
+            "  RELAY.EXAMPLE.:8443  ",
+        ] {
+            assert_eq!(normalize_host(variant), canonical, "variant {variant:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_host_ignores_non_port_colon_suffixes() {
+        // Only an all-digit suffix after the final colon is a port; anything
+        // else is left alone rather than silently truncating the host.
+        assert_eq!(normalize_host("relay.example:"), "relay.example:");
+        assert_eq!(normalize_host("relay.example:http"), "relay.example:http");
+        assert_eq!(normalize_host("relay.example:80x"), "relay.example:80x");
+    }
+
+    #[test]
     fn normalize_host_leaves_ipv6_literal_intact() {
         // IPv6 literals contain colons but no trailing default-port suffix.
         assert_eq!(normalize_host("[::1]"), "[::1]");
         assert_eq!(normalize_host("[::1]:443"), "[::1]");
+        // A bracketed literal's own colons must never be read as a port
+        // delimiter, so a non-default port survives alongside them.
+        assert_eq!(normalize_host("[::1]:3000"), "[::1]:3000");
+        assert_eq!(normalize_host("[2001:db8::1]"), "[2001:db8::1]");
     }
 
     #[test]
@@ -257,6 +315,22 @@ mod tests {
             "relay.example"
         );
         assert_eq!(relay_url_authority("wss://relay.example"), "relay.example");
+    }
+
+    #[test]
+    fn relay_url_authority_collapses_fqdn_dot() {
+        // A relay URL written with the FQDN root dot must derive the same
+        // authority as one without it, at any port — otherwise the seeded
+        // community lands under a host no inbound request resolves to.
+        assert_eq!(
+            relay_url_authority("wss://relay.example.:8443"),
+            "relay.example:8443"
+        );
+        assert_eq!(relay_url_authority("wss://relay.example."), "relay.example");
+        assert_eq!(
+            relay_url_authority("wss://relay.example.:443"),
+            "relay.example"
+        );
     }
 
     #[test]
