@@ -515,13 +515,27 @@ mod tests {
         std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
     }
 
+    /// `Utc::now()` truncated to the fence's own storage resolution.
+    ///
+    /// `fence_micros` is unix *micros*, so a fence advanced to a timestamp
+    /// carrying sub-microsecond nanos reads back truncated and can never
+    /// compare equal to its input. Clock resolution is platform-dependent —
+    /// `Utc::now()` yields whole micros on macOS but nanos on Linux — so a test
+    /// that advances the fence with a raw `Utc::now()` and asserts an exact
+    /// round-trip passes on one and fails on the other. Sampling at the
+    /// fence's resolution keeps the assertions portable.
+    fn now_at_fence_resolution() -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("`Utc::now()` is always representable as micros")
+    }
+
     #[test]
     fn fence_starts_closed_and_opens_on_advance() {
         let fence = ReplicaFence::new();
         assert!(fence.verified_through().is_none(), "must start closed");
         assert!(!fence.covers(Utc::now() - chrono::Duration::days(365)));
 
-        let ts = Utc::now();
+        let ts = now_at_fence_resolution();
         fence.advance(ts);
         assert_eq!(fence.verified_through(), Some(ts));
         assert!(fence.covers(ts - chrono::Duration::seconds(1)));
@@ -531,6 +545,36 @@ mod tests {
         fence.close();
         assert!(fence.verified_through().is_none(), "close() must close");
         assert!(!fence.covers(ts - chrono::Duration::days(365)));
+    }
+
+    #[test]
+    fn advance_truncates_downward_so_the_fence_stays_conservative() {
+        // `fence_micros` drops sub-microsecond nanos. The direction of that
+        // truncation is a safety property, not a rounding detail: rounding *up*
+        // would let the fence claim coverage through an instant the probe never
+        // verified, routing a cursor read to a replica that may be missing rows
+        // in the remainder. Rounding down only ever under-claims, which routes
+        // back to the writer — degraded capacity, never holes.
+        let fence = ReplicaFence::new();
+        let ts = DateTime::from_timestamp_nanos(1_700_000_000_123_456_789);
+        fence.advance(ts);
+
+        let verified = fence
+            .verified_through()
+            .expect("fence is open after advance");
+        assert!(
+            verified <= ts,
+            "fence must never verify past its input: {verified} > {ts}"
+        );
+        assert_eq!(
+            verified,
+            DateTime::from_timestamp_nanos(1_700_000_000_123_456_000),
+            "the sub-microsecond remainder must be dropped, not rounded up"
+        );
+        assert!(
+            !fence.covers(ts),
+            "the dropped sub-microsecond remainder must read as uncovered"
+        );
     }
 
     #[test]
