@@ -100,7 +100,7 @@ impl AuditService {
         };
         let seq = prev_seq + 1;
 
-        let created_at: DateTime<Utc> = Utc::now();
+        let created_at: DateTime<Utc> = db_precision_now();
 
         let mut audit_entry = AuditEntry {
             community_id,
@@ -226,6 +226,24 @@ impl AuditService {
     }
 }
 
+/// `Utc::now()` truncated to the microsecond precision a Postgres `timestamptz`
+/// actually stores.
+///
+/// The audit hash commits to `created_at`, so the value that gets hashed must be
+/// one the column can hold *exactly*. `Utc::now()` carries nanoseconds on Linux
+/// and Postgres rounds them away on write, so hashing the un-truncated instant
+/// binds the entry to a timestamp that no longer exists once the row is read
+/// back: [`AuditService::verify_chain`] then recomputes a different digest and
+/// reports [`AuditError::HashMismatch`] on a chain nobody tampered with.
+///
+/// Truncating here — before both the hash and the INSERT bind — keeps the hashed
+/// and stored timestamps byte-identical, so the chain round-trips.
+fn db_precision_now() -> DateTime<Utc> {
+    let now = Utc::now();
+    // Only fails outside the representable range, which `Utc::now()` never is.
+    DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap_or(now)
+}
+
 fn row_to_audit_entry(row: &sqlx::postgres::PgRow) -> Result<AuditEntry, AuditError> {
     let action_str: String = row.get("action");
     let action: AuditAction = action_str.parse().map_err(|_| {
@@ -290,6 +308,57 @@ mod tests {
             object_id: Some(format!("obj_{}", Uuid::new_v4())),
             detail: serde_json::json!({"test": true}),
         }
+    }
+
+    /// The audit hash commits to `created_at`, and Postgres `timestamptz` holds
+    /// only microseconds. If the hashed instant carries sub-microsecond nanos —
+    /// which `Utc::now()` does on Linux — the stored row rounds them away and
+    /// every later `verify_chain` recomputes a different digest, reporting
+    /// `HashMismatch` on an untampered chain.
+    ///
+    /// This runs without infra deliberately: the Postgres-backed tests below
+    /// are `#[ignore]`d, so they are not what catches a regression here.
+    #[test]
+    fn hashed_timestamp_is_already_at_postgres_precision() {
+        for _ in 0..2_000 {
+            let ts = db_precision_now();
+            assert_eq!(
+                ts.timestamp_subsec_nanos() % 1_000,
+                0,
+                "created_at must carry no sub-microsecond component before it is \
+                 hashed, or the chain cannot survive a Postgres round-trip: {ts:?}"
+            );
+        }
+    }
+
+    /// A timestamp and its microsecond-truncated form hash differently, which is
+    /// exactly why the truncation has to happen before `compute_hash`, not after.
+    #[test]
+    fn sub_microsecond_nanos_change_the_entry_hash() {
+        let with_nanos = DateTime::from_timestamp_nanos(1_767_225_600_123_456_789);
+        let truncated = DateTime::from_timestamp_micros(with_nanos.timestamp_micros())
+            .expect("in-range timestamp");
+        assert_ne!(with_nanos, truncated, "the two instants must differ");
+
+        let mut a = AuditEntry {
+            community_id: Uuid::from_u128(1),
+            seq: 1,
+            hash: Vec::new(),
+            prev_hash: None,
+            action: AuditAction::EventCreated,
+            actor_pubkey: Some(vec![0xab; 32]),
+            object_id: Some("abc123".into()),
+            detail: serde_json::Value::Null,
+            created_at: with_nanos,
+        };
+        let hash_with_nanos = compute_hash(&a).expect("hash");
+        a.created_at = truncated;
+        let hash_truncated = compute_hash(&a).expect("hash");
+
+        assert_ne!(
+            hash_with_nanos, hash_truncated,
+            "sub-microsecond nanos must change the digest — this is the round-trip hazard"
+        );
     }
 
     #[tokio::test]
