@@ -19,6 +19,14 @@ use crate::{
 /// taken with `pg_advisory_lock(hashtextextended(...))` — see [`AuditService::log`].
 const AUDIT_LOCK_NAMESPACE: &str = "buzz_audit:";
 
+/// Sequence number of the first entry in every community's chain.
+///
+/// [`AuditService::log`] assigns `prev_seq + 1` starting from an absent head, so
+/// a community's first entry is always `seq = 1` with a `NULL` `prev_hash`.
+/// [`AuditService::verify_chain`] relies on that to detect a chain whose
+/// earliest entries have been deleted.
+const GENESIS_SEQ: i64 = 1;
+
 /// Append-only, per-community hash-chain audit log backed by Postgres.
 ///
 /// Each community has an independent chain keyed `(community_id, seq)`. Writes
@@ -147,6 +155,27 @@ impl AuditService {
     /// Reads exactly that community's chain — it can never observe another
     /// community's entries or head. Returns `Ok(false)` if the range is empty,
     /// `Ok(true)` if the segment is internally consistent.
+    ///
+    /// ## What a passing result does and does not mean
+    ///
+    /// Each entry's `prev_hash` is checked against its predecessor's hash and
+    /// its digest is recomputed, so *interior* edits and deletions are caught:
+    /// a survivor's `prev_hash` no longer matches the row that now precedes it.
+    ///
+    /// The first row in a range has no predecessor inside the range to link
+    /// against. When `from_seq <= 1` the caller is asking about the chain from
+    /// its start, so the segment must actually begin at the genesis row
+    /// ([`GENESIS_SEQ`] with a `NULL` `prev_hash`, which is what
+    /// [`AuditService::log`] always writes first). Without that check, deleting
+    /// entries `1..k` left a remainder that verified cleanly — the earliest
+    /// entries, community creation and initial owner grants, being exactly what
+    /// an attacker would drop.
+    ///
+    /// **Still not detected: truncation of the tail.** Removing the newest
+    /// entries leaves a prefix that is genuinely self-consistent, and nothing in
+    /// the table distinguishes "chain ends here" from "chain was cut here".
+    /// Catching that needs an anchor outside the log — a signed or externally
+    /// replicated head — which this type does not have.
     #[instrument(skip(self))]
     pub async fn verify_chain(
         &self,
@@ -175,8 +204,19 @@ impl AuditService {
 
         let mut expected_prev: Option<Vec<u8>> = None;
 
-        for row in &rows {
+        for (idx, row) in rows.iter().enumerate() {
             let entry = row_to_audit_entry(row)?;
+
+            // A range that starts at (or before) the chain's beginning must
+            // actually contain the genesis row. Nothing inside the segment can
+            // reveal that earlier entries were removed, because the survivors
+            // still link to each other correctly.
+            if idx == 0
+                && from_seq <= GENESIS_SEQ
+                && (entry.seq != GENESIS_SEQ || entry.prev_hash.is_some())
+            {
+                return Err(AuditError::ChainViolation { seq: entry.seq });
+            }
 
             if let Some(ref expected) = expected_prev {
                 // The previous entry's hash must equal this entry's prev_hash.
@@ -513,6 +553,88 @@ mod tests {
 
         let r = svc.verify_chain(CommunityId::from_uuid(c), 1, 3).await;
         assert!(matches!(r, Err(AuditError::HashMismatch { seq }) if seq == e2.seq));
+    }
+
+    /// Deleting the earliest entries must not verify.
+    ///
+    /// Interior deletions are already caught: the survivor's `prev_hash` points
+    /// at a row that is no longer its predecessor, so the link check fires. The
+    /// head is the gap — the first row in a range has nothing before it to link
+    /// against, so truncating `1..k` leaves a segment that is internally
+    /// perfectly consistent. Since the write path always starts a community's
+    /// chain at `seq = 1` with `prev_hash = NULL`, a verification that begins at
+    /// the chain's start can and must insist on seeing that genesis row.
+    ///
+    /// This is the high-value target for anyone editing an audit log: the
+    /// earliest rows are community creation and the initial owner grants.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn verify_detects_deletion_of_the_chain_head() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = AuditService::new(pool.clone());
+        let c = make_community(&pool).await;
+
+        for action in [
+            AuditAction::EventCreated,
+            AuditAction::EventDeleted,
+            AuditAction::ChannelDeleted,
+        ] {
+            svc.log(new_entry(c, action)).await.unwrap();
+        }
+        assert!(
+            svc.verify_chain(CommunityId::from_uuid(c), 1, 3)
+                .await
+                .unwrap(),
+            "intact chain must verify"
+        );
+
+        // Excise the genesis entry, as someone hiding the chain's origin would.
+        sqlx::query("DELETE FROM audit_log WHERE community_id = $1 AND seq = 1")
+            .bind(c)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Entries 2..3 still link to each other, and entry 2's stored prev_hash
+        // still matches its own digest, so nothing internal to the segment is
+        // wrong — only the missing origin gives it away.
+        let r = svc.verify_chain(CommunityId::from_uuid(c), 1, 3).await;
+        assert!(
+            matches!(r, Err(AuditError::ChainViolation { seq }) if seq == 2),
+            "a chain missing its genesis row must not verify, got {r:?}"
+        );
+    }
+
+    /// Verifying a strict sub-range stays legal: a caller asking about
+    /// `[2, 3]` is not claiming to have seen the head, so the genesis
+    /// requirement must not fire there.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn verify_of_a_sub_range_does_not_require_genesis() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = AuditService::new(pool.clone());
+        let c = make_community(&pool).await;
+
+        for action in [
+            AuditAction::EventCreated,
+            AuditAction::EventDeleted,
+            AuditAction::ChannelDeleted,
+        ] {
+            svc.log(new_entry(c, action)).await.unwrap();
+        }
+
+        assert!(
+            svc.verify_chain(CommunityId::from_uuid(c), 2, 3)
+                .await
+                .unwrap(),
+            "a sub-range that legitimately starts past seq 1 must still verify"
+        );
     }
 
     /// A row forged with another community's id cannot pass verification against
