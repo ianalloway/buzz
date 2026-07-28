@@ -661,6 +661,99 @@ jobs:
           path: /tmp/buzz-relay.log
           if-no-files-found: ignore
 
+  db-integration:
+    name: Isolated DB Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Start database services
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose up -d postgres redis; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "docker compose up failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "docker compose up failed (attempt $attempt), retrying in $((attempt * 5))s..." >&2
+            sleep $((attempt * 5))
+          done
+      - name: Wait for database services
+        run: |
+          wait_healthy() {
+            local service="$1"
+            local container="$2"
+            for attempt in $(seq 1 60); do
+              status=$(docker inspect --format='{{.State.Health.Status}}' "${container}" 2>/dev/null || echo "not_found")
+              if [ "${status}" = "healthy" ]; then
+                echo "${service} is healthy"
+                return 0
+              fi
+              sleep 2
+            done
+            docker logs "${container}" || true
+            return 1
+          }
+          wait_healthy "Postgres" "buzz-postgres"
+          wait_healthy "Redis" "buzz-redis"
+      - name: Apply schema
+        # Same desired-state apply the relay integration job uses, minus the
+        # deployment-community seed: nothing here boots a relay, so there is no
+        # host to resolve. Partitions are attached explicitly because pgschema
+        # does not manage them.
+        env:
+          PGSCHEMA_PLAN_HOST: localhost
+          PGSCHEMA_PLAN_PORT: "5432"
+          PGSCHEMA_PLAN_DB: buzz
+          PGSCHEMA_PLAN_USER: buzz
+          PGSCHEMA_PLAN_PASSWORD: buzz_dev
+        run: |
+          ./bin/pgschema apply --file schema/schema.sql --auto-approve
+          docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
+            psql -U buzz -d buzz -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
+      - name: Postgres-backed unit tests
+        # The gate `scripts/run-tests.sh` calls for and did not have. Its unit
+        # step is infra-free, so it runs these crates with `--lib` only (or, for
+        # buzz-audit and buzz-search, not at all), and its integration step uses
+        # `--test '*'`, which matches integration targets and never `--lib`. The
+        # net effect was that every #[ignore = "requires Postgres"] test in the
+        # workspace executed nowhere — which is how a `buzz-audit` hash chain
+        # that could not verify on Linux shipped green (see #2).
+        #
+        # Serial: these share one database, and the suites assert on absolute
+        # row state rather than isolating per-test.
+        #
+        # buzz-relay's #[ignore]d set is deliberately NOT here.
+        # `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo` is
+        # order-dependent — it fails in a full sequential run, then passes on a
+        # re-run and in isolation. Gating it would import that flake into every
+        # PR. It wants fixing on its own terms first.
+        run: |
+          cargo test --profile ci \
+            -p buzz-db -p buzz-audit -p buzz-search -p buzz-media -p buzz-pubsub \
+            --lib -- --include-ignored --test-threads=1
+          cargo test --profile ci -p buzz-search --test fts_integration \
+            -- --include-ignored --test-threads=1
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
+      - name: Dump service logs
+        if: failure()
+        run: |
+          docker logs buzz-postgres || true
+          docker logs buzz-redis || true
+
   relay-e2e:
     name: Relay E2E
     runs-on: ubuntu-latest
