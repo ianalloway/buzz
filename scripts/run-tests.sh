@@ -87,10 +87,12 @@ run_unit_tests() {
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
   # script, not startup state) and the tenant-scoping lints. The Postgres-backed
-  # buzz-db tests are #[ignore]d, so --lib keeps this step infra-free; the
-  # separate isolated-DB gate they need is the `Isolated DB Tests`
-  # (`db-integration`) job in .github/workflows/ci.yml, which runs them with
-  # --include-ignored against a real Postgres.
+  # buzz-db tests are #[ignore]d, so --lib keeps this step infra-free. They still
+  # have no gate: the `Isolated DB Tests` (`db-integration`) job in
+  # .github/workflows/ci.yml covers buzz-audit, buzz-search, buzz-media, and
+  # buzz-pubsub, but excludes buzz-db because two of its community-creation
+  # tests share one owner pubkey and trip MAX_COMMUNITIES_PER_OWNER — see that
+  # job's comment.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
 
