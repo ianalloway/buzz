@@ -742,18 +742,24 @@ jobs:
         # Serial: these suites assert on absolute row state rather than
         # isolating per-test, so they cannot share a database concurrently.
         #
-        # buzz-db is NOT gated here, and the reason is a real defect rather than
-        # a flaky suite: `schema/schema.sql` is missing four tables that
-        # `migrations/*.sql` creates — git_repo_names, join_policy_acceptances,
-        # parameterized_event_watermarks, and product_feedback. This job builds
-        # its database from that schema, so `git_repo::tests::*` fail with
-        # `relation "git_repo_names" does not exist`. Gating buzz-db has to wait
-        # until the declarative schema and the migration chain agree. See the PR
-        # for the drift detail — it is worth reading, because the same gap makes
-        # `pgschema apply` plan DROP ... CASCADE for those tables against any
-        # database the migrations built.
+        # buzz-db is gated here now. It previously could not be: this job builds
+        # its database from `schema/schema.sql`, and that file had fallen behind
+        # `migrations/*.sql` — four missing tables, a missing column, ten missing
+        # indexes, and the five NIP-RS/mesh guard functions with their triggers —
+        # so `git_repo::tests::*` failed with `relation "git_repo_names" does not
+        # exist`. The declarative schema and the migration chain now agree
+        # object-for-object, which is what makes gating it possible at all.
         #
-        # buzz-relay is also NOT gated.
+        # It runs in its own step, after everything else, and that ordering is
+        # load-bearing rather than cosmetic: buzz-db's migrator tests call
+        # `reset_public_schema` — `DROP SCHEMA public CASCADE` — and rebuild the
+        # database from `migrations/*.sql`. Folded into the command above it
+        # would drop the schema out from under whichever suites cargo happens to
+        # schedule after it, and the surviving suites would then be testing a
+        # migrations-built database while claiming to test the declarative one.
+        # Last means nothing runs after the wipe.
+        #
+        # buzz-relay is still NOT gated.
         # `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo` fails
         # in a full sequential run, then passes on a re-run and in isolation.
         # Gating it would import that flake into every PR, and it wants fixing on
@@ -764,6 +770,8 @@ jobs:
             --lib -- --include-ignored --test-threads=1
           cargo test --profile ci -p buzz-search --test fts_integration \
             -- --include-ignored --test-threads=1
+          cargo test --profile ci -p buzz-db \
+            --lib -- --include-ignored --test-threads=1
         env:
           # Three variables for one database, because the suites disagree about
           # which to read: buzz-db's `setup_db` takes TEST_DATABASE_URL, its

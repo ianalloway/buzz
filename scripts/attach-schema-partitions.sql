@@ -8,106 +8,50 @@
 -- pgschema-created schemas need this repair step.
 
 DO $$
+DECLARE
+    part   RECORD;
+    trig   text;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p_past'::regclass
-    ) THEN
-        -- pgschema may copy parent triggers onto standalone children. Drop
-        -- those copies before ATTACH; PostgreSQL recreates inherited parent
-        -- triggers while attaching and rejects same-named child triggers
-        -- (both the push-match trigger and the replica-fence floor guard).
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p_past;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p_past;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p_past;
-        ALTER TABLE events ATTACH PARTITION events_p_past
-            FOR VALUES FROM (MINVALUE) TO ('2026-01-01');
-    END IF;
+    -- pgschema copies the parent's triggers onto each standalone child. Drop
+    -- those copies before ATTACH: PostgreSQL recreates the inherited parent
+    -- triggers while attaching and rejects same-named child triggers.
+    --
+    -- Every non-internal trigger on the child is dropped rather than a
+    -- hardcoded list of names. schema/schema.sql declares no partition-local
+    -- triggers — every trigger a child carries here is a copy of one the
+    -- parent owns — so this is equivalent to naming them, and it does not go
+    -- stale the next time a trigger is added to `events`. The previous list
+    -- named three and silently became wrong when the NIP-RS guards landed.
+    FOR part IN
+        SELECT *
+        FROM (VALUES
+            ('events_p_past',    'FROM (MINVALUE) TO (''2026-01-01'')'),
+            ('events_p2026_01',  'FROM (''2026-01-01'') TO (''2026-02-01'')'),
+            ('events_p2026_02',  'FROM (''2026-02-01'') TO (''2026-03-01'')'),
+            ('events_p2026_03',  'FROM (''2026-03-01'') TO (''2026-04-01'')'),
+            ('events_p2026_04',  'FROM (''2026-04-01'') TO (''2026-05-01'')'),
+            ('events_p2026_05',  'FROM (''2026-05-01'') TO (''2026-06-01'')'),
+            ('events_p2026_06',  'FROM (''2026-06-01'') TO (''2026-07-01'')'),
+            ('events_p_future',  'FROM (''2026-07-01'') TO (MAXVALUE)')
+        ) AS t(child, bounds)
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_inherits
+            WHERE inhparent = 'events'::regclass
+              AND inhrelid = part.child::regclass
+        ) THEN
+            FOR trig IN
+                SELECT tgname FROM pg_trigger
+                WHERE tgrelid = part.child::regclass AND NOT tgisinternal
+            LOOP
+                EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', trig, part.child);
+            END LOOP;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_01'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_01;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_01;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_01;
-        ALTER TABLE events ATTACH PARTITION events_p2026_01
-            FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_02'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_02;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_02;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_02;
-        ALTER TABLE events ATTACH PARTITION events_p2026_02
-            FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_03'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_03;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_03;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_03;
-        ALTER TABLE events ATTACH PARTITION events_p2026_03
-            FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_04'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_04;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_04;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_04;
-        ALTER TABLE events ATTACH PARTITION events_p2026_04
-            FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_05'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_05;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_05;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_05;
-        ALTER TABLE events ATTACH PARTITION events_p2026_05
-            FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p2026_06'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p2026_06;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p2026_06;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p2026_06;
-        ALTER TABLE events ATTACH PARTITION events_p2026_06
-            FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_inherits
-        WHERE inhparent = 'events'::regclass
-          AND inhrelid = 'events_p_future'::regclass
-    ) THEN
-        DROP TRIGGER IF EXISTS events_enqueue_push_match ON events_p_future;
-        DROP TRIGGER IF EXISTS events_refresh_channel_ttl ON events_p_future;
-        DROP TRIGGER IF EXISTS events_created_at_floor ON events_p_future;
-        ALTER TABLE events ATTACH PARTITION events_p_future
-            FOR VALUES FROM ('2026-07-01') TO (MAXVALUE);
-    END IF;
+            EXECUTE format(
+                'ALTER TABLE events ATTACH PARTITION %I FOR VALUES %s',
+                part.child, part.bounds);
+        END IF;
+    END LOOP;
 
     -- When pgschema creates partition children as standalone tables, it also
     -- preserves the parent's identity column on delivery_log children. PostgreSQL
