@@ -87,12 +87,17 @@ run_unit_tests() {
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
   # script, not startup state) and the tenant-scoping lints. The Postgres-backed
-  # buzz-db tests are #[ignore]d, so --lib keeps this step infra-free. They still
-  # have no gate: the `Isolated DB Tests` (`db-integration`) job in
-  # .github/workflows/ci.yml covers buzz-audit, buzz-search, buzz-media, and
-  # buzz-pubsub, but excludes buzz-db because two of its community-creation
-  # tests share one owner pubkey and trip MAX_COMMUNITIES_PER_OWNER — see that
-  # job's comment.
+  # buzz-db tests are #[ignore]d, so --lib keeps this step infra-free. Those
+  # Postgres-backed tests still have no gate: the `Isolated DB Tests`
+  # (`db-integration`) job builds its database from schema/schema.sql, which is
+  # missing four tables the migrations create, so buzz-db's git_repo tests fail
+  # there. See that job's comment.
+  #
+  # If you run them by hand: build the database from migrations/*.sql, not from
+  # schema/schema.sql. And note `setup_db` reads TEST_DATABASE_URL while the
+  # product_feedback tests read BUZZ_TEST_DATABASE_URL or DATABASE_URL — both
+  # fall back to a hardcoded localhost default, so setting only one sends part
+  # of the suite to a different database than you think. Set all three.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
 

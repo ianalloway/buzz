@@ -742,21 +742,22 @@ jobs:
         # Serial: these suites assert on absolute row state rather than
         # isolating per-test, so they cannot share a database concurrently.
         #
-        # Two #[ignore]d sets are deliberately NOT gated here, because both are
-        # order-dependent today and gating them would import a flake into every
-        # PR. Each wants fixing on its own terms; see the PR for measurements.
+        # buzz-db is NOT gated here, and the reason is a real defect rather than
+        # a flaky suite: `schema/schema.sql` is missing four tables that
+        # `migrations/*.sql` creates — git_repo_names, join_policy_acceptances,
+        # parameterized_event_watermarks, and product_feedback. This job builds
+        # its database from that schema, so `git_repo::tests::*` fail with
+        # `relation "git_repo_names" does not exist`. Gating buzz-db has to wait
+        # until the declarative schema and the migration chain agree. See the PR
+        # for the drift detail — it is worth reading, because the same gap makes
+        # `pgschema apply` plan DROP ... CASCADE for those tables against any
+        # database the migrations built.
         #
-        #   buzz-db — `create_community_with_owner_is_atomic_and_create_only`
-        #   and `concurrent_same_owner_create_returns_the_winning_row_to_both_callers`
-        #   fail 3/3 runs on a pristine database. They share one hardcoded owner
-        #   pubkey with the rest of the suite, and MAX_COMMUNITIES_PER_OWNER (3)
-        #   is counted globally per pubkey with no archived-row filter, so the
-        #   suite can exhaust its own cap and get LimitReached where it asserts
-        #   Created. Needs per-test owner identities, not a retry here.
-        #
-        #   buzz-relay — `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo`
-        #   fails in a full sequential run, then passes on a re-run and in
-        #   isolation.
+        # buzz-relay is also NOT gated.
+        # `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo` fails
+        # in a full sequential run, then passes on a re-run and in isolation.
+        # Gating it would import that flake into every PR, and it wants fixing on
+        # its own terms rather than a retry wrapper here.
         run: |
           cargo test --profile ci \
             -p buzz-audit -p buzz-search -p buzz-media -p buzz-pubsub \
@@ -764,7 +765,17 @@ jobs:
           cargo test --profile ci -p buzz-search --test fts_integration \
             -- --include-ignored --test-threads=1
         env:
+          # Three variables for one database, because the suites disagree about
+          # which to read: buzz-db's `setup_db` takes TEST_DATABASE_URL, its
+          # `product_feedback` tests take BUZZ_TEST_DATABASE_URL or DATABASE_URL,
+          # and the rest take DATABASE_URL. Each falls back to a hardcoded
+          # localhost default that happens to match this compose service, so
+          # setting only one still "works" — while silently sending part of the
+          # suite somewhere else. Set all three so the target is explicit rather
+          # than a coincidence.
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          BUZZ_TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           REDIS_URL: redis://localhost:6379
       - name: Dump service logs
         if: failure()
