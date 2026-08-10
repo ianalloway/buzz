@@ -55,6 +55,11 @@ CREATE TABLE communities (
     host            VARCHAR(255) NOT NULL,
     signing_key     BYTEA,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Per-community workspace icon (NIP-11 `icon`), set by the kind:9033
+    -- command and served in the relay information document for the community
+    -- resolved from the request Host. Holds either an http(s) URL or a small
+    -- `data:image/*` URL — validated and size-capped at the 9033 write path.
+    icon            TEXT,
     archived_at     TIMESTAMPTZ,
     CONSTRAINT chk_communities_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
 );
@@ -265,6 +270,14 @@ CREATE INDEX idx_events_not_before ON events (community_id, not_before)
 -- stays a single-column GIN. The search lane confirms the final spelling with
 -- EXPLAIN before its work lands (Quinn option A; Max's index-spelling caveat).
 CREATE INDEX idx_events_search_tsv ON events USING GIN (search_tsv);
+-- #e fan-out. Every "events targeting these rows" hop resolves with JSONB
+-- containment (`tags @> '[["e","<hex>"]]'`); without this index each hop
+-- bitmap-scans every partition on a community-leading btree and filters ~100k
+-- rows to find a handful. jsonb_path_ops supports exactly `@>`, the only
+-- operator that path uses, and is smaller than the default jsonb_ops.
+-- On a partitioned parent, CREATE INDEX recurses to all partitions and future
+-- partitions inherit it.
+CREATE INDEX idx_events_tags_gin ON events USING GIN (tags jsonb_path_ops);
 
 -- ── Event mentions ────────────────────────────────────────────────────────────
 -- Conformance: "Channel-less global events and DMs" (#p fan-out). The join to
@@ -286,6 +299,239 @@ CREATE INDEX idx_event_mentions_pubkey_created
     ON event_mentions (community_id, pubkey_hex, event_created_at DESC);
 CREATE INDEX idx_event_mentions_pubkey_kind_created
     ON event_mentions (community_id, pubkey_hex, event_kind, event_created_at DESC);
+-- Superseded read-state events normally have no p-tags, but malformed/legacy
+-- rows can. Serves the defensive mention cleanup in the NIP-RS purge trigger
+-- below without a per-replacement seq scan.
+CREATE INDEX idx_event_mentions_community_event
+    ON event_mentions (community_id, event_id);
+
+-- ── NIP-RS retention watermarks + database guards ─────────────────────────────
+-- Conformance: replay ordering is durable even though payload history is not.
+--
+-- NIP-RS read-state (kind:30078, `d` = `read-state:<32 hex>`) is high-churn and
+-- has no historical product value, so superseded payloads are physically
+-- removed rather than soft-deleted. Removing them would ordinarily reopen the
+-- NIP-33 replay window, because "have I already seen a newer event for this
+-- coordinate?" was answered by the retained rows. This compact watermark keeps
+-- the greatest accepted (created_at, event_id) per coordinate — the only
+-- historical fact replacement needs — so retention and replay protection do
+-- not trade off against each other.
+--
+-- The guards below are enforced in the database rather than only in the relay
+-- because a rolling deploy can have old relay binaries writing concurrently.
+
+CREATE TABLE parameterized_event_watermarks (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    kind          INT NOT NULL,
+    pubkey        BYTEA NOT NULL,
+    d_tag         TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    event_id      BYTEA NOT NULL,
+    PRIMARY KEY (community_id, kind, pubkey, d_tag)
+);
+
+-- Advance the watermark on insert, or reject the write as stale. The tag
+-- predicates are deliberately exact rather than broad EXISTS checks: exactly
+-- one `d` tag whose value matches the row's `d_tag`, and exactly one
+-- `["t","read-state"]`. A broader match would let a crafted event claim a
+-- coordinate it does not own. Re-inserting the identical tuple is idempotent
+-- (RETURN NULL) rather than an error, so a retried write is not a failure.
+CREATE FUNCTION guard_nip_rs_watermark() RETURNS trigger AS $$
+DECLARE
+    advanced BOOLEAN;
+BEGIN
+    IF NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        INSERT INTO parameterized_event_watermarks
+            (community_id, kind, pubkey, d_tag, created_at, event_id)
+        VALUES
+            (NEW.community_id, NEW.kind, NEW.pubkey, NEW.d_tag, NEW.created_at, NEW.id)
+        ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET
+            created_at = EXCLUDED.created_at,
+            event_id = EXCLUDED.event_id
+        WHERE EXCLUDED.created_at > parameterized_event_watermarks.created_at
+           OR (EXCLUDED.created_at = parameterized_event_watermarks.created_at
+               AND EXCLUDED.event_id < parameterized_event_watermarks.event_id)
+        RETURNING TRUE INTO advanced;
+
+        IF NOT COALESCE(advanced, FALSE) THEN
+            IF EXISTS (
+                SELECT 1
+                FROM parameterized_event_watermarks
+                WHERE community_id = NEW.community_id
+                  AND kind = NEW.kind
+                  AND pubkey = NEW.pubkey
+                  AND d_tag = NEW.d_tag
+                  AND created_at = NEW.created_at
+                  AND event_id = NEW.id
+            ) THEN
+                RETURN NULL;
+            END IF;
+
+            RAISE EXCEPTION 'stale NIP-RS event rejected by durable watermark'
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events
+    FOR EACH ROW EXECUTE FUNCTION guard_nip_rs_watermark();
+
+-- A relay binary from before the corrected guard can classify an incoming event
+-- by broad predicates and hard-delete the current coordinate before its INSERT
+-- guard runs. Fail the whole old-writer transaction rather than silently
+-- skipping the DELETE (which would permit two live rows and strip the retained
+-- row's mentions). Corrected paths opt in transaction-locally via
+-- `set_config('buzz.nip_rs_hard_delete', 'on', true)`.
+CREATE FUNCTION guard_nip_rs_hard_delete() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('buzz.nip_rs_hard_delete', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'NIP-RS hard delete requires corrected writer opt-in'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events
+    FOR EACH ROW
+    WHEN (OLD.kind = 30078 AND OLD.d_tag ~ '^read-state:[0-9a-f]{32}$')
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+-- Enforce physical removal in the database when an old relay binary uses its
+-- legacy soft-delete path, including NIP-09 coordinate deletion during a
+-- mixed-version rollout. Same exact tag predicates as the watermark guard.
+CREATE FUNCTION purge_soft_deleted_nip_rs() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        PERFORM set_config('buzz.nip_rs_hard_delete', 'on', true);
+
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+-- Mention indexing runs after the event transaction commits. Lock the live
+-- event row while a mention is inserted so a concurrent hard delete cannot
+-- leave an orphan behind; if deletion already won, silently skip the stale
+-- index row.
+CREATE FUNCTION guard_event_mention_live() RETURNS trigger AS $$
+BEGIN
+    IF NEW.event_kind IS DISTINCT FROM 30078 THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM 1
+    FROM events
+    WHERE community_id = NEW.community_id
+      AND id = NEW.event_id
+      AND created_at = NEW.event_created_at
+      AND deleted_at IS NULL
+    FOR KEY SHARE;
+
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_event_mentions_require_live_event
+    BEFORE INSERT ON event_mentions
+    FOR EACH ROW EXECUTE FUNCTION guard_event_mention_live();
+
+-- ── Mesh status retention ─────────────────────────────────────────────────────
+-- Mesh status is a heartbeat carried in a reserved kind:30003 coordinate. Only
+-- the live head has product value; retaining every superseded 45-second payload
+-- creates unbounded physical history. Covers soft-delete writes from older
+-- relay binaries during rolling deploys, the same way the NIP-RS purge above
+-- does for read-state.
+
+CREATE FUNCTION purge_soft_deleted_buzz_mesh_status() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30003
+       AND NEW.d_tag LIKE 'buzz-mesh-member-status:%'
+       AND NEW.tags @> '[["k", "buzz-mesh-status"]]'::jsonb THEN
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
 
 -- ── Subscriptions ─────────────────────────────────────────────────────────────
 -- Conformance: "Mesh, agents, ACP/MCP, and CLI" (persisted subscriptions).
@@ -572,6 +818,46 @@ CREATE TABLE relay_members (
 
 CREATE INDEX idx_relay_members_role ON relay_members (community_id, role);
 
+-- ── Join policy acceptances ───────────────────────────────────────────────────
+-- Conformance: membership gate, community-scoped. Durable evidence of the
+-- policy version accepted when an invite claim grants relay membership. Rows
+-- are scoped to the same community and member identity as relay_members and
+-- are deleted with that membership, so the FK carries the full community tuple
+-- rather than pubkey alone.
+
+CREATE TABLE join_policy_acceptances (
+    community_id UUID NOT NULL,
+    pubkey TEXT NOT NULL,
+    policy_version TEXT NOT NULL CHECK (length(policy_version) = 64),
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, pubkey, policy_version),
+    FOREIGN KEY (community_id, pubkey)
+        REFERENCES relay_members (community_id, pubkey) ON DELETE CASCADE
+);
+
+-- ── Git repo name registry (NIP-34 kind:30617) ────────────────────────────────
+-- Conformance: repo names are unique within a community, never across. The
+-- relay holds no persistent per-repo filesystem state — git reads/writes
+-- hydrate an ephemeral bare repo from object storage per request, and writer
+-- serialization is the object-store pointer CAS (docs/git-on-object-storage.md,
+-- Inv_NoFork). This table is the one remaining shared-state need, moved off
+-- local disk so the relay is stateless and can run multiple replicas without a
+-- ReadWriteMany volume. The PK enforces name uniqueness atomically
+-- (INSERT … ON CONFLICT), replacing the old atomic `create_dir`.
+-- `owner_pubkey` distinguishes idempotent re-announce (same owner) from
+-- collision (different owner), and backs the per-pubkey quota via COUNT.
+
+CREATE TABLE git_repo_names (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    repo_id       TEXT NOT NULL,
+    owner_pubkey  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, repo_id)
+);
+
+-- Backs the per-pubkey repo quota: COUNT(*) WHERE community_id = $1 AND owner_pubkey = $2.
+CREATE INDEX idx_git_repo_names_owner ON git_repo_names (community_id, owner_pubkey);
+
 -- ── Archived identities (NIP-IA) ──────────────────────────────────────────────
 -- Conformance: archive cannot hide a key in another community. PK scoped.
 
@@ -745,6 +1031,35 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('communities',           'the tenant registry itself; id IS the community key'),
     ('rate_limit_violations', 'deployment abuse/health; never tenant-observable; community_id is an attribution label only'),
     ('_operator_global_tables', 'the registry table itself');
+
+-- ── Product feedback ──────────────────────────────────────────────────────────
+-- Buzz product feedback is accepted through a dedicated signed event kind and
+-- sidecarred here instead of entering the ordinary events table. Rows remain
+-- attributable to their source community, while deployment operators may
+-- review the table across communities through internal tooling — which is why
+-- it is registered as operator-global below rather than tenant-scoped.
+
+CREATE TABLE product_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    community_id UUID NOT NULL REFERENCES communities(id),
+    event_id BYTEA NOT NULL CHECK (length(event_id) = 32),
+    submitter_pubkey BYTEA NOT NULL CHECK (length(submitter_pubkey) = 32),
+    category TEXT CHECK (category IN ('bug', 'praise', 'needs-work')),
+    body TEXT NOT NULL CHECK (length(btrim(body)) > 0),
+    tags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(tags) = 'array'),
+    event_created_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id)
+);
+
+CREATE INDEX idx_product_feedback_received
+    ON product_feedback (received_at DESC, id);
+CREATE INDEX idx_product_feedback_community_received
+    ON product_feedback (community_id, received_at DESC, id);
+
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('product_feedback', 'deployment product inbox; community_id is provenance only');
+
 -- NIP-PL effective lease state and durable wake outbox. Every key is led by
 -- community_id: client-provided origin is confirmation only, never routing.
 CREATE TABLE push_leases (
@@ -822,12 +1137,17 @@ CREATE INDEX push_match_queue_recovery
 -- community has an active, endpoint-enabled, unexpired lease; the shared
 -- advisory lock pairs with the exclusive lock taken by lease activations
 -- (crates/buzz-db/src/push.rs) to close the lost-wake race.
+-- Centralizing the kind allowlist on the events table covers every durable
+-- producer, including internal paths that bypass live dispatch.
+--
+-- The body below is byte-identical to the one the migration chain installs.
+-- Keep it that way: `pgschema` compares function source text, so even a
+-- comment that exists on one side and not the other makes every plan against
+-- a migrations-built database non-empty.
 CREATE FUNCTION enqueue_push_match_job() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     -- Keep this allowlist identical to the relay's validated NIP-PL descriptor.
-    -- Centralizing it on the events table covers every durable producer,
-    -- including internal paths that bypass live dispatch.
     IF NEW.kind IN (7, 9, 1059, 40007, 46010) THEN
         PERFORM pg_advisory_xact_lock_shared(
             hashtextextended('buzz_push_gate:' || NEW.community_id::text, 0));

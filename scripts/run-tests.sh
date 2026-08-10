@@ -88,16 +88,15 @@ run_unit_tests() {
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
   # script, not startup state) and the tenant-scoping lints. The Postgres-backed
   # buzz-db tests are #[ignore]d, so --lib keeps this step infra-free. Those
-  # Postgres-backed tests still have no gate: the `Isolated DB Tests`
-  # (`db-integration`) job builds its database from schema/schema.sql, which is
-  # missing four tables the migrations create, so buzz-db's git_repo tests fail
-  # there. See that job's comment.
+  # Postgres-backed tests are gated by the `Isolated DB Tests`
+  # (`db-integration`) CI job, which runs them with --include-ignored.
   #
-  # If you run them by hand: build the database from migrations/*.sql, not from
-  # schema/schema.sql. And note `setup_db` reads TEST_DATABASE_URL while the
-  # product_feedback tests read BUZZ_TEST_DATABASE_URL or DATABASE_URL — both
-  # fall back to a hardcoded localhost default, so setting only one sends part
-  # of the suite to a different database than you think. Set all three.
+  # If you run them by hand, note that `setup_db` reads TEST_DATABASE_URL while
+  # the product_feedback tests read BUZZ_TEST_DATABASE_URL or DATABASE_URL —
+  # both fall back to a hardcoded localhost default, so setting only one sends
+  # part of the suite to a different database than you think. Set all three.
+  # Either schema source works now that schema/schema.sql and migrations/*.sql
+  # agree; CI builds from schema.sql.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
 
