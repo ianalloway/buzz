@@ -15,6 +15,18 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # nostr-relay-pool 0.44.3 — unmaintained as a standalone crate; its
+    # functionality moved into nostr-sdk >= 0.45. Not a vulnerability: the
+    # advisory carries no patched version ("No safe upgrade is available"), so
+    # `cargo update` cannot clear it.
+    #
+    # This workspace does not depend on it. It arrives only on a dev edge —
+    # mesh-llm v0.73.1 (pinned git tag) → nostr-sdk 0.44.1 → nostr-relay-pool —
+    # reachable solely through buzz-relay's [dev-dependencies]:
+    # `cargo tree --workspace --edges normal --target all -i nostr-relay-pool`
+    # prints nothing on any target. Remove this when mesh-llm moves to
+    # nostr-sdk >= 0.45.
+    { id = "RUSTSEC-2026-0243", reason = "transitive via mesh-llm → nostr-sdk; dev-dependency only; folded into nostr-sdk >= 0.45, no upgrade available at this pin" },
 ]
 
 [licenses]
