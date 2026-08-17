@@ -83,7 +83,7 @@ impl MeshPeer {
         self.counters.streams_opened.fetch_add(1, Ordering::Relaxed);
         Ok(MeshStream::new(
             Box::new(IrohSendHalf(send)),
-            Box::new(IrohRecvHalf(recv)),
+            Box::new(IrohRecvHalf::new(recv)),
         ))
     }
 
@@ -98,7 +98,7 @@ impl MeshPeer {
             .fetch_add(1, Ordering::Relaxed);
         Ok(MeshStream::new(
             Box::new(IrohSendHalf(send)),
-            Box::new(IrohRecvHalf(recv)),
+            Box::new(IrohRecvHalf::new(recv)),
         ))
     }
 
@@ -130,7 +130,51 @@ impl MeshPeer {
 }
 
 struct IrohSendHalf(iroh::endpoint::SendStream);
-struct IrohRecvHalf(iroh::endpoint::RecvStream);
+
+/// Receive half with resumable framing state.
+///
+/// `recv_frame` must be cancel-safe: callers race it inside `tokio::select!`
+/// against tickers, roster deltas and shutdown tokens (see
+/// `buzz-relay`'s `audio::join` control loop and `mesh_boot::run_demo_echo`),
+/// and `select!` drops the losing future. Quinn is explicit that its
+/// `read_exact` is *not* cancel-safe while `read` is, so a cancelled
+/// `read_exact` silently swallows the bytes it had already taken off the
+/// stream — leaving the next `recv_frame` to read a length prefix from the
+/// middle of a frame body and desynchronise the stream permanently.
+///
+/// Progress is therefore recorded on the half itself, and every `.await`
+/// below sits at a point where all consumed bytes are already accounted for
+/// in `partial`. A dropped future costs at most a wakeup, never a byte.
+struct IrohRecvHalf {
+    recv: iroh::endpoint::RecvStream,
+    partial: RecvProgress,
+}
+
+/// How far the in-flight frame has been read.
+enum RecvProgress {
+    /// Reading the 4-byte little-endian length prefix.
+    Len { buf: [u8; 4], got: usize },
+    /// Prefix decoded; filling the body buffer.
+    Body { buf: Vec<u8>, got: usize },
+}
+
+impl RecvProgress {
+    const fn new() -> Self {
+        Self::Len {
+            buf: [0u8; 4],
+            got: 0,
+        }
+    }
+}
+
+impl IrohRecvHalf {
+    fn new(recv: iroh::endpoint::RecvStream) -> Self {
+        Self {
+            recv,
+            partial: RecvProgress::new(),
+        }
+    }
+}
 
 impl StreamSendHalf for IrohSendHalf {
     fn send_frame(
@@ -167,27 +211,63 @@ impl StreamSendHalf for IrohSendHalf {
 impl StreamRecvHalf for IrohRecvHalf {
     fn recv_frame(&mut self) -> crate::BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
         Box::pin(async move {
-            let mut len = [0u8; 4];
-            match self.0.read_exact(&mut len).await {
-                Ok(_) => {}
-                Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
-                Err(err) => return Err(MeshError::Transport(err.to_string())),
+            loop {
+                // Disjoint field borrows: the read borrows `recv` while the
+                // progress it advances borrows `partial`.
+                let Self { recv, partial } = self;
+                match partial {
+                    RecvProgress::Len { buf, got } => {
+                        match recv.read(&mut buf[*got..]).await {
+                            // Clean end of stream, but only between frames.
+                            // Finishing mid-prefix is a truncation, not EOF.
+                            Ok(None) | Ok(Some(0)) => {
+                                return if *got == 0 {
+                                    Ok(None)
+                                } else {
+                                    Err(MeshError::Transport(
+                                        "stream finished mid-length-prefix".into(),
+                                    ))
+                                };
+                            }
+                            Ok(Some(n)) => *got += n,
+                            Err(err) => return Err(MeshError::Transport(err.to_string())),
+                        }
+                        if *got == buf.len() {
+                            let len = u32::from_le_bytes(*buf);
+                            if len > wire::MAX_STREAM_FRAME {
+                                return Err(MeshError::FrameTooLarge {
+                                    size: len as usize,
+                                    max: wire::MAX_STREAM_FRAME as usize,
+                                });
+                            }
+                            *partial = RecvProgress::Body {
+                                buf: vec![0u8; len as usize],
+                                got: 0,
+                            };
+                        }
+                    }
+                    RecvProgress::Body { buf, got } => {
+                        if *got < buf.len() {
+                            match recv.read(&mut buf[*got..]).await {
+                                Ok(None) | Ok(Some(0)) => {
+                                    return Err(MeshError::Transport(
+                                        "stream finished mid-frame body".into(),
+                                    ))
+                                }
+                                Ok(Some(n)) => *got += n,
+                                Err(err) => return Err(MeshError::Transport(err.to_string())),
+                            }
+                        }
+                        if *got == buf.len() {
+                            // Reset before decoding so a decode error still
+                            // leaves the half framed at a frame boundary.
+                            let bytes = std::mem::take(buf);
+                            *partial = RecvProgress::new();
+                            return wire::decode::<MeshStreamFrame>(&bytes).map(Some);
+                        }
+                    }
+                }
             }
-
-            let len = u32::from_le_bytes(len);
-            if len > wire::MAX_STREAM_FRAME {
-                return Err(MeshError::FrameTooLarge {
-                    size: len as usize,
-                    max: wire::MAX_STREAM_FRAME as usize,
-                });
-            }
-
-            let mut bytes = vec![0u8; len as usize];
-            self.0
-                .read_exact(&mut bytes)
-                .await
-                .map_err(|err| MeshError::Transport(err.to_string()))?;
-            wire::decode::<MeshStreamFrame>(&bytes).map(Some)
         })
     }
 }
