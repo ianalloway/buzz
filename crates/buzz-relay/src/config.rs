@@ -185,6 +185,16 @@ pub struct Config {
     pub media_max_concurrent_uploads_per_pubkey: u32,
     /// Maximum media upload starts accepted from one pubkey per minute.
     pub media_uploads_per_minute: u32,
+    /// Maximum time to wait for the next chunk of a media upload body before
+    /// aborting the upload and releasing its admission permits.
+    ///
+    /// Default: 30 seconds. Set via `BUZZ_MEDIA_UPLOAD_IDLE_TIMEOUT_SECS`.
+    pub media_upload_idle_timeout: Duration,
+    /// Maximum wall-clock time allowed to receive a full media upload body
+    /// before aborting the upload and releasing its admission permits.
+    ///
+    /// Default: 600 seconds. Set via `BUZZ_MEDIA_UPLOAD_TOTAL_TIMEOUT_SECS`.
+    pub media_upload_total_timeout: Duration,
 
     /// Require Blossom kind:24242 `t=get` auth plus relay membership before
     /// serving media GET/HEAD. Default off for staged client rollout.
@@ -666,6 +676,20 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(30);
+        let media_upload_idle_timeout = Duration::from_secs(
+            std::env::var("BUZZ_MEDIA_UPLOAD_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v: &u64| v > 0)
+                .unwrap_or(30),
+        );
+        let media_upload_total_timeout = Duration::from_secs(
+            std::env::var("BUZZ_MEDIA_UPLOAD_TOTAL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v: &u64| v > 0)
+                .unwrap_or(600),
+        );
 
         let require_media_get_auth = std::env::var("BUZZ_REQUIRE_MEDIA_GET_AUTH")
             .map(|v| {
@@ -889,6 +913,8 @@ impl Config {
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
+            media_upload_idle_timeout,
+            media_upload_total_timeout,
             require_media_get_auth,
             audit_enabled,
             ephemeral_ttl_override,

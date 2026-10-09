@@ -237,6 +237,43 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
     }
 }
 
+/// Wrap an upload body stream so it fails when no chunk arrives within `idle`
+/// or the whole body has not been received within `total` (measured from when
+/// the wrapper is created). On timeout the stream yields one error and then
+/// ends, so whichever pipeline is consuming it aborts and the request's
+/// [`UploadPermit`] is dropped.
+fn with_upload_body_timeouts<S>(
+    stream: S,
+    idle: Duration,
+    total: Duration,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + Unpin + 'static,
+{
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + total;
+    futures_util::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        let idle_deadline = (tokio::time::Instant::now() + idle).min(deadline);
+        match tokio::time::timeout_at(idle_deadline, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some(stream))),
+            Ok(None) => None,
+            Err(_) => {
+                let reason = if idle_deadline >= deadline {
+                    "upload body exceeded total time limit"
+                } else {
+                    "upload body idle timeout"
+                };
+                metrics::counter!("buzz_media_upload_rejections_total", "reason" => "timeout")
+                    .increment(1);
+                let error = std::io::Error::new(std::io::ErrorKind::TimedOut, reason);
+                Some((Err(axum::Error::new(error)), None))
+            }
+        }
+    })
+}
+
 /// Build per-event upload attribution when upload records are enabled
 /// (`BUZZ_MEDIA_UPLOAD_RECORDS`). Returns `None` when the feature is off —
 /// the upload pipeline then writes no `_uploads/` record at all.
@@ -319,7 +356,13 @@ pub async fn upload_blob(
     // stored/hash-verified body remains byte-identical.
     use futures_util::StreamExt;
     const SNIFF_BYTES: usize = 4096;
-    let mut source = body.into_data_stream();
+    // Bound how long an admitted upload may hold its global/per-pubkey permits:
+    // a stalled or trickling body errors out instead of pinning a slot forever.
+    let mut source = Box::pin(with_upload_body_timeouts(
+        body.into_data_stream(),
+        state.config.media_upload_idle_timeout,
+        state.config.media_upload_total_timeout,
+    ));
     let mut replay_chunks = Vec::new();
     let mut sniff = Vec::with_capacity(SNIFF_BYTES);
     while sniff.len() < SNIFF_BYTES {
@@ -943,6 +986,76 @@ mod tests {
         let bytes = b"\x00\x00\x00\x18ftypPRIV\x00\x00\x00\x00isommp42";
         assert!(infer::get(bytes).is_none());
         assert!(should_stream_as_video(bytes));
+    }
+
+    #[tokio::test]
+    async fn upload_body_idle_timeout_fires_on_pending_stream() {
+        use futures_util::StreamExt;
+
+        let pending = futures_util::stream::pending::<Result<bytes::Bytes, axum::Error>>();
+        let mut stream = Box::pin(with_upload_body_timeouts(
+            pending,
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        ));
+        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("idle timeout must fire before the outer guard");
+        let error = item
+            .expect("timeout yields an item")
+            .expect_err("timeout is an error");
+        assert!(error.to_string().contains("idle timeout"), "{error}");
+        assert!(
+            stream.next().await.is_none(),
+            "stream ends after timing out"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_body_total_deadline_fires_on_trickling_stream() {
+        use futures_util::StreamExt;
+
+        // A chunk every 20ms never trips a 1s idle timeout, but the 100ms total
+        // deadline must still cut the upload off.
+        let trickle = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok::<_, axum::Error>(bytes::Bytes::from_static(b"x")), ()))
+        });
+        let mut stream = Box::pin(with_upload_body_timeouts(
+            Box::pin(trickle),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(item) = stream.next().await {
+                if let Err(error) = item {
+                    return error;
+                }
+            }
+            panic!("stream ended without a timeout error");
+        })
+        .await
+        .expect("total deadline must fire before the outer guard");
+        assert!(
+            outcome.to_string().contains("total time limit"),
+            "{outcome}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_body_timeouts_pass_through_complete_stream() {
+        use futures_util::StreamExt;
+
+        let chunks = futures_util::stream::iter(vec![
+            Ok::<_, axum::Error>(bytes::Bytes::from_static(b"ab")),
+            Ok(bytes::Bytes::from_static(b"cd")),
+        ]);
+        let collected: Vec<_> =
+            with_upload_body_timeouts(chunks, Duration::from_secs(1), Duration::from_secs(1))
+                .map(|item| item.expect("no timeout"))
+                .collect()
+                .await;
+        assert_eq!(collected, vec![&b"ab"[..], &b"cd"[..]]);
     }
 
     async fn test_state() -> Arc<AppState> {
