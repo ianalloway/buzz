@@ -60,6 +60,11 @@ pub struct WorkflowConfig {
     pub max_concurrent: usize,
     /// Default per-step timeout in seconds. Default: 300 (5 minutes).
     pub default_timeout_secs: u64,
+    /// Public key the relay signs its own events with. An `actor` tag is only
+    /// trusted as the trigger author on events signed by this key (e.g.
+    /// workflow-generated messages); on any other event the verified signer is
+    /// the author. Default: `None` — `actor` tags are never trusted.
+    pub relay_pubkey: Option<nostr::PublicKey>,
 }
 
 impl Default for WorkflowConfig {
@@ -67,6 +72,7 @@ impl Default for WorkflowConfig {
         Self {
             max_concurrent: 100,
             default_timeout_secs: 300,
+            relay_pubkey: None,
         }
     }
 }
@@ -313,7 +319,7 @@ impl WorkflowEngine {
             return Ok(());
         }
 
-        let trigger_ctx = build_trigger_context(event);
+        let trigger_ctx = build_trigger_context(event, self.config.relay_pubkey.as_ref());
 
         let trigger_ctx_json: serde_json::Value = match serde_json::to_value(&trigger_ctx) {
             Ok(v) => v,
@@ -875,27 +881,34 @@ async fn should_fire_workflow(
 /// Build a [`executor::TriggerContext`] from a [`buzz_core::StoredEvent`].
 ///
 /// - `text` — event content (message body or reaction emoji character)
-/// - `author` — pubkey hex string
+/// - `author` — pubkey hex string: the verified event signer, or the `actor`
+///   tag value when the event is signed by `relay_pubkey` (relay-generated
+///   events attribute their real author that way). Client-signed `actor` tags
+///   are ignored so a sender cannot impersonate another user.
 /// - `channel_id` — channel UUID as string (empty if no channel scope)
 /// - `timestamp` — Unix timestamp as string
 /// - `emoji` — for `KIND_REACTION` events, the content is the emoji; otherwise empty
 /// - `message_id` — for reactions, the target message's event ID (from `e` tag);
 ///   for all other events, the event's own ID
-pub fn build_trigger_context(event: &buzz_core::StoredEvent) -> executor::TriggerContext {
+pub fn build_trigger_context(
+    event: &buzz_core::StoredEvent,
+    relay_pubkey: Option<&nostr::PublicKey>,
+) -> executor::TriggerContext {
     let kind_u32 = event_kind_u32(&event.event);
     let content = event.event.content.clone();
 
-    let author = event
-        .event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            if tag.kind().to_string() == "actor" {
-                tag.content().map(|value| value.to_string())
-            } else {
-                None
-            }
+    let relay_signed = relay_pubkey.is_some_and(|relay| event.event.pubkey == *relay);
+    let author = relay_signed
+        .then(|| {
+            event.event.tags.iter().find_map(|tag| {
+                if tag.kind().to_string() == "actor" {
+                    tag.content().map(|value| value.to_string())
+                } else {
+                    None
+                }
+            })
         })
+        .flatten()
         .unwrap_or_else(|| event.event.pubkey.to_hex());
 
     // For reaction events (NIP-25), the content field holds the emoji character
@@ -1423,6 +1436,7 @@ steps:
         let cfg = WorkflowConfig {
             max_concurrent: 50,
             default_timeout_secs: 600,
+            relay_pubkey: None,
         };
         assert_eq!(cfg.max_concurrent, 50);
         assert_eq!(cfg.default_timeout_secs, 600);
@@ -1466,7 +1480,7 @@ steps:
     #[test]
     fn build_trigger_context_message_event() {
         let stored = make_message_event();
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
 
         assert_eq!(ctx.text, "hello world");
         assert_eq!(ctx.author, stored.event.pubkey.to_hex());
@@ -1481,7 +1495,7 @@ steps:
     #[test]
     fn build_trigger_context_reaction_event() {
         let (stored, target_id_hex) = make_reaction_event();
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
 
         // For reactions, content IS the emoji.
         assert_eq!(ctx.text, "👍");
@@ -1503,7 +1517,7 @@ steps:
             .expect("sign");
         // channel_id = None (global/DM event)
         let stored = buzz_core::StoredEvent::new(event, None);
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
 
         assert_eq!(ctx.channel_id, "");
         assert_eq!(ctx.text, "msg");
@@ -1512,7 +1526,7 @@ steps:
     #[test]
     fn build_trigger_context_author_is_hex_pubkey() {
         let stored = make_message_event();
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
         // Pubkey hex is 64 lowercase hex characters.
         assert_eq!(ctx.author.len(), 64);
         assert!(ctx.author.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1521,7 +1535,7 @@ steps:
     #[test]
     fn build_trigger_context_message_id_is_hex() {
         let stored = make_message_event();
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
         // Event ID hex is 64 lowercase hex characters.
         assert_eq!(ctx.message_id.len(), 64);
         assert!(ctx.message_id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1530,11 +1544,45 @@ steps:
     #[test]
     fn build_trigger_context_timestamp_is_numeric_string() {
         let stored = make_message_event();
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
         // Timestamp must parse as a u64.
         ctx.timestamp
             .parse::<u64>()
             .expect("timestamp should be a u64 string");
+    }
+
+    fn make_event_with_actor(signer: &nostr::Keys, actor_hex: &str) -> buzz_core::StoredEvent {
+        use nostr::{EventBuilder, Kind, Tag};
+        let event = EventBuilder::new(Kind::Custom(9), "hi")
+            .tags([Tag::parse(["actor", actor_hex]).expect("actor tag")])
+            .sign_with_keys(signer)
+            .expect("sign");
+        buzz_core::StoredEvent::new(event, Some(uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn build_trigger_context_ignores_actor_tag_on_client_signed_event() {
+        let relay = nostr::Keys::generate();
+        let attacker = nostr::Keys::generate();
+        let victim = nostr::Keys::generate();
+        let stored = make_event_with_actor(&attacker, &victim.public_key().to_hex());
+
+        let ctx = build_trigger_context(&stored, Some(&relay.public_key()));
+        assert_eq!(ctx.author, attacker.public_key().to_hex());
+
+        // Without a configured relay key, actor tags are never trusted.
+        let ctx = build_trigger_context(&stored, None);
+        assert_eq!(ctx.author, attacker.public_key().to_hex());
+    }
+
+    #[test]
+    fn build_trigger_context_honors_actor_tag_on_relay_signed_event() {
+        let relay = nostr::Keys::generate();
+        let human = nostr::Keys::generate();
+        let stored = make_event_with_actor(&relay, &human.public_key().to_hex());
+
+        let ctx = build_trigger_context(&stored, Some(&relay.public_key()));
+        assert_eq!(ctx.author, human.public_key().to_hex());
     }
 
     #[test]
@@ -1556,7 +1604,7 @@ steps:
             .expect("sign");
 
         let stored = buzz_core::StoredEvent::new(event, Some(Uuid::new_v4()));
-        let ctx = build_trigger_context(&stored);
+        let ctx = build_trigger_context(&stored, None);
 
         // Should pick the LAST e tag (direct target), not the first (thread root)
         assert_eq!(ctx.message_id, direct_target_id.to_hex());

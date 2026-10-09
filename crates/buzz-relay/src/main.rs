@@ -384,9 +384,6 @@ async fn main() -> anyhow::Result<()> {
         "Search service ready (Postgres FTS)"
     );
 
-    let workflow_config = buzz_workflow::WorkflowConfig::default();
-    let workflow_engine = Arc::new(WorkflowEngine::new(db.clone(), workflow_config));
-
     let relay_keypair = if let Some(hex) = &config.relay_private_key {
         nostr::Keys::parse(hex)
             .map_err(|e| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY: {e}"))?
@@ -409,6 +406,14 @@ async fn main() -> anyhow::Result<()> {
              A stable relay identity is required for production."
         );
     };
+
+    // The relay key lets the workflow engine trust `actor` attribution only on
+    // relay-signed events; client-signed `actor` tags are ignored.
+    let workflow_config = buzz_workflow::WorkflowConfig {
+        relay_pubkey: Some(relay_keypair.public_key()),
+        ..buzz_workflow::WorkflowConfig::default()
+    };
+    let workflow_engine = Arc::new(WorkflowEngine::new(db.clone(), workflow_config));
 
     config
         .media
