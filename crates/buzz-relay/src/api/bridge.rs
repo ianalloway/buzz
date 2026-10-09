@@ -1519,6 +1519,13 @@ pub async fn workflow_webhook(
         }
     }
 
+    // Disabled workflows must not run from any trigger. Event and schedule
+    // triggers only consider active + enabled rows whose definition is
+    // enabled; enforce the same gate here before a run is created.
+    if !workflow_accepts_webhook(&workflow.status, workflow.enabled, &def) {
+        return Err(api_error(StatusCode::CONFLICT, "workflow is disabled"));
+    }
+
     // Parse optional JSON body as trigger context.
     let body_json: Option<Value> =
         if body.is_empty() {
@@ -1604,6 +1611,17 @@ pub async fn workflow_webhook(
             "status": "pending",
         })),
     ))
+}
+
+/// Whether a workflow may be started by its webhook: the row must be active
+/// and enabled, and the persisted definition must not set `enabled: false`.
+/// Mirrors the gate applied to event- and schedule-triggered runs.
+fn workflow_accepts_webhook(
+    status: &buzz_db::workflow::WorkflowStatus,
+    record_enabled: bool,
+    def: &buzz_workflow::WorkflowDef,
+) -> bool {
+    *status == buzz_db::workflow::WorkflowStatus::Active && record_enabled && def.enabled
 }
 
 /// If all filters target kind:20001 or kind:40902 with authors, synthesize
@@ -1885,6 +1903,46 @@ mod tests {
         deadpool_redis::Config::from_url(url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .expect("create redis pool")
+    }
+
+    fn webhook_def(enabled: bool) -> buzz_workflow::WorkflowDef {
+        let yaml = format!(
+            "name: Hook\nenabled: {enabled}\ntrigger:\n  on: webhook\nsteps:\n  - id: s1\n    action: delay\n    duration: 1m\n"
+        );
+        serde_yaml::from_str(&yaml).expect("parse webhook workflow")
+    }
+
+    #[test]
+    fn webhook_rejects_disabled_workflows() {
+        use buzz_db::workflow::WorkflowStatus;
+
+        assert!(workflow_accepts_webhook(
+            &WorkflowStatus::Active,
+            true,
+            &webhook_def(true)
+        ));
+        // Definition-level `enabled: false` (the field the event/schedule
+        // triggers check) must block the webhook path too.
+        assert!(!workflow_accepts_webhook(
+            &WorkflowStatus::Active,
+            true,
+            &webhook_def(false)
+        ));
+        assert!(!workflow_accepts_webhook(
+            &WorkflowStatus::Active,
+            false,
+            &webhook_def(true)
+        ));
+        assert!(!workflow_accepts_webhook(
+            &WorkflowStatus::Disabled,
+            true,
+            &webhook_def(true)
+        ));
+        assert!(!workflow_accepts_webhook(
+            &WorkflowStatus::Archived,
+            true,
+            &webhook_def(true)
+        ));
     }
 
     fn fresh_tenant(host: &str) -> TenantContext {
