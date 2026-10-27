@@ -72,7 +72,7 @@ env:
   # Single source of truth for the image name. Set GHCR_IMAGE as a repo
   # variable to override (e.g., for forks that want to push to their own
   # namespace without forking this file).
-  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}
+  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || format('ghcr.io/{0}', github.repository) }}
 
 jobs:
   build:
