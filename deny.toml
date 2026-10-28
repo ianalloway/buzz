@@ -27,6 +27,18 @@ ignore = [
     # prints nothing on any target. Remove this when mesh-llm moves to
     # nostr-sdk >= 0.45.
     { id = "RUSTSEC-2026-0243", reason = "transitive via mesh-llm → nostr-sdk; dev-dependency only; folded into nostr-sdk >= 0.45, no upgrade available at this pin" },
+    # unsafe-libyaml 0.2.11 — unmaintained (repository archived 2024-03-25), not a
+    # vulnerability report. Transitive dep: serde_yaml → unsafe-libyaml. The serde_yaml_ng
+    # fork uses the same crate, so removing it means migrating YAML parsing in
+    # buzz-agent, buzz-persona, buzz-relay, buzz-workflow and desktop.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via serde_yaml; unmaintained, not vulnerable; removal needs a YAML parser migration" },
+    # zip 2.4.2: extraction keeps setuid/setgid bits (0367), creates symlinks that
+    # escape the destination (0368) and applies permissions through symlinks (0369).
+    # Path: mesh-llm v0.73.1 → mesh-llm-host-runtime / plugin-manager / system → zip.
+    # Upgrade to zip >=9 is not reachable at this mesh-llm pin; recheck on bump.
+    { id = "RUSTSEC-2026-0367", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
 ]
 
 [licenses]
