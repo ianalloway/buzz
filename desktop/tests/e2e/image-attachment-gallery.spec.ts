@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
@@ -322,10 +322,54 @@ test("hidden spoiler images are excluded from gallery navigation until revealed"
   await spoiler.click();
   await expect(spoiler).toHaveAttribute("data-revealed", "true");
 
+  // The gallery is collected from the DOM at click time, and it skips any
+  // trigger whose image is still 0×0 or at opacity 0. Revealing a spoiler
+  // starts a CSS opacity transition and may still be laying out the image,
+  // so on a slow CI runner an immediate click can open a one-image gallery
+  // (no "Next image"). Wait until the revealed image passes the same checks
+  // the gallery uses before reopening the lightbox.
+  await waitForGalleryCandidate(row, SPOILER_HIDDEN_SHA);
+  await waitForAnimations(page);
+
   await row.locator(`img[src*="${SPOILER_VISIBLE_SHA}"]`).click();
   await expect(dialog).toBeVisible();
   await expect(page.getByRole("button", { name: "Next image" })).toBeVisible();
 });
+
+async function waitForGalleryCandidate(row: Locator, sha: string) {
+  const image = row.locator(`img[src*="${sha}"]`).first();
+  await expect(image).toBeVisible();
+  await expect
+    .poll(
+      () =>
+        image.evaluate((img) => {
+          if (
+            img.closest('.buzz-spoiler[data-spoiler][data-revealed="false"]')
+          ) {
+            return "inside hidden spoiler";
+          }
+          const trigger = img.closest("[data-image-lightbox-trigger]");
+          for (const el of [trigger, img]) {
+            if (!el) continue;
+            const style = window.getComputedStyle(el);
+            if (
+              style.display === "none" ||
+              style.visibility === "hidden" ||
+              Number(style.opacity) === 0
+            ) {
+              return `not visible (opacity ${style.opacity})`;
+            }
+          }
+          const rect = img.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) {
+            return "zero-size";
+          }
+          return "ready";
+        }),
+      { message: "revealed spoiler image never became a gallery candidate" },
+    )
+    .toBe("ready");
+}
 
 test("message images load a thumbnail before requesting the original", async ({
   page,
