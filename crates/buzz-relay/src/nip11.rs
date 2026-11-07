@@ -515,6 +515,18 @@ mod tests {
     /// NIP-43 events are verified against `self`; advertising NIP-43 without
     /// `self` would give clients no way to verify membership events. The
     /// debug_assert in `build` catches this in tests/debug builds.
+    ///
+    /// Compiled out when debug assertions are off, because then there is no
+    /// `debug_assert` left to fire and `#[should_panic]` fails. That is not
+    /// hypothetical: `[profile.ci]` inherits `release`, so it carries
+    /// `debug-assertions = false`, and this test fails under
+    /// `cargo test --profile ci`. It went unnoticed while buzz-relay was not
+    /// run by any `--profile ci` job; gating the crate in `Isolated DB Tests`
+    /// surfaced it. Enabling `debug-assertions` for `[profile.ci]` would be the
+    /// broader fix — it would restore `debug_assert` coverage for every crate
+    /// that job runs — but it also flips `overflow-checks` workspace-wide, so
+    /// it belongs in its own change rather than riding along here.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "advertise_nip43=true requires relay_self=Some")]
     fn build_nip43_without_self_panics_in_debug() {

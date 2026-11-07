@@ -696,7 +696,9 @@ fn spawn_lease_renewer_with_interval(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Mutex;
+    use std::task::{Context, Waker};
 
     use buzz_relay_mesh::endpoint::MeshEndpoint;
     use buzz_relay_mesh::{InboundHandler, MeshDatagram, PeerInfo};
@@ -900,9 +902,16 @@ mod tests {
     /// blocked forever on a frame the peer had already sent — the join-side
     /// probe then failed its 10s echo timeout with a 504.
     ///
-    /// `Duration::ZERO` polls the inner future exactly once, which is enough
-    /// to consume the buffered frame and park on the fence await, so this
-    /// reproduces that cancellation deterministically.
+    /// The cancellation is driven by polling the call exactly once by hand.
+    /// `tokio::time::timeout(Duration::ZERO, ..)` is NOT equivalent and was
+    /// wrong here: tokio's `Timeout` polls the inner future before the expired
+    /// timer, so when the runtime polls the task a second time — after the
+    /// reactor has delivered the Redis response — the whole call completes and
+    /// nothing is ever cancelled. That made the first version of this test pass
+    /// locally and fail on CI. A single manual poll gives the reactor no chance
+    /// to run between the frame read and the fence await, so the fence is
+    /// guaranteed pending and the cancellation lands exactly where the bug used
+    /// to lose the frame.
     #[tokio::test]
     async fn cancelled_recv_validated_keeps_the_frame_it_already_read() {
         let Some(directory) = redis_directory_if_available().await else {
@@ -945,18 +954,35 @@ mod tests {
             .unwrap();
         let mut receiver = ReliableMeshStream::new_inbound(fenced, accept_bi.await.unwrap());
 
-        // Let the frame land in the receiver's buffer, so the single poll below
-        // gets as far as the fence await rather than stalling on the read.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let cancelled =
-            tokio::time::timeout(Duration::ZERO, receiver.recv_validated(&directory)).await;
+        // The frame has to be readable before a single poll can get past the
+        // read and reach the fence await. Rather than assume one fixed sleep is
+        // enough — it is not, on a loaded runner — poll-and-cancel in a bounded
+        // loop until the park is observed, sleeping between attempts so the
+        // reactor can deliver the datagram. Each iteration is itself a
+        // cancellation, so a build that loses the frame never parks it and the
+        // loop runs out.
+        let mut parked = false;
+        for _ in 0..50 {
+            {
+                let mut call = std::pin::pin!(receiver.recv_validated(&directory));
+                let mut cx = Context::from_waker(Waker::noop());
+                // A single poll cannot finish the Redis round trip, because the
+                // reactor does not run inside it. Anything but `Pending` means
+                // this test is no longer exercising the fence await.
+                assert!(
+                    call.as_mut().poll(&mut cx).is_pending(),
+                    "one poll must not finish the call: it has to reach the fence await"
+                );
+            }
+            // Dropping `call` above IS the cancellation.
+            if receiver.pending.is_some() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
-            cancelled.is_err(),
-            "zero timeout should cancel before the fence check completes"
-        );
-        assert!(
-            receiver.pending.is_some(),
+            parked,
             "the cancelled call must leave the decoded frame parked on the stream"
         );
 
