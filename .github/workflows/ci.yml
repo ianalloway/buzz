@@ -664,7 +664,9 @@ jobs:
   db-integration:
     name: Isolated DB Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 was comfortable at ~7 minutes; adding buzz-relay adds a cold-cache
+    # compile of the workspace's largest crate plus its 743 tests.
+    timeout-minutes: 35
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     permissions:
@@ -759,17 +761,27 @@ jobs:
         # migrations-built database while claiming to test the declarative one.
         # Last means nothing runs after the wipe.
         #
-        # buzz-relay is still NOT gated.
-        # `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo` fails
-        # in a full sequential run, then passes on a re-run and in isolation.
-        # Gating it would import that flake into every PR, and it wants fixing on
-        # its own terms rather than a retry wrapper here.
+        # buzz-relay is gated now. It could not be before:
+        # `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo` failed
+        # in a full sequential run and passed on a re-run, which would have
+        # imported a flake into every PR. That was not a flake in the test — it
+        # was a cancel-safety bug in `tunnel::reliable::recv_validated`, which
+        # held a decoded frame in a local across the Redis fence await and lost it
+        # whenever a caller cancelled there. Both callers cancel at exactly that
+        # point in normal operation. Fixed by parking the frame on the stream, so
+        # the suite is deterministic and belongs in the gate rather than behind a
+        # retry wrapper.
+        #
+        # Before buzz-db, for the same reason buzz-db is last: buzz-db wipes the
+        # schema.
         run: |
           cargo test --profile ci \
             -p buzz-audit -p buzz-search -p buzz-media -p buzz-pubsub \
             --lib -- --include-ignored --test-threads=1
           cargo test --profile ci -p buzz-search --test fts_integration \
             -- --include-ignored --test-threads=1
+          cargo test --profile ci -p buzz-relay \
+            --lib -- --include-ignored --test-threads=1
           cargo test --profile ci -p buzz-db \
             --lib -- --include-ignored --test-threads=1
         env:
