@@ -236,6 +236,21 @@ pub struct ReliableMeshStream {
     fenced: FencedHeader,
     stream: MeshStream,
     community_id: Option<CommunityId>,
+    /// A frame already taken off the wire and decoded, but not yet
+    /// fence-validated.
+    ///
+    /// [`Self::recv_validated`] must be cancel-safe: both callers drop its
+    /// future mid-flight — `mesh_boot::run_demo_echo` races it in a
+    /// `tokio::select!` against a drain ticker, and `api::mesh_demo` wraps it
+    /// in `tokio::time::timeout`. Validating the fence costs a Redis round
+    /// trip, so the window between "frame is off the stream" and "frame is
+    /// validated" is an await point. Parking the frame here keeps a
+    /// cancellation at that point from dropping it: the next call resumes
+    /// with the same frame instead of waiting forever for one the peer has
+    /// already sent.
+    /// Boxed so parking, which is the rare path, does not widen
+    /// `ReliableJoin::Forwarded` for every caller.
+    pending: Option<Box<(FencedHeader, ReliableWireFrame)>>,
 }
 
 impl ReliableMeshStream {
@@ -245,6 +260,7 @@ impl ReliableMeshStream {
             fenced,
             stream,
             community_id: None,
+            pending: None,
         }
     }
 
@@ -333,29 +349,51 @@ impl ReliableMeshStream {
         &mut self,
         directory: &SessionDirectory,
     ) -> Result<Option<ReliableFrame>, ReliableStreamError> {
-        let Some(frame) = self.stream.recv_frame().await? else {
-            return Ok(None);
+        // Take the next frame off the stream only if a previous cancelled call
+        // did not already leave one parked.
+        if self.pending.is_none() {
+            let Some(frame) = self.stream.recv_frame().await? else {
+                return Ok(None);
+            };
+            self.pending = Some(Box::new(match frame {
+                MeshStreamFrame::Data { fenced, payload } => {
+                    (fenced, ReliableWireFrame::decode(&payload)?)
+                }
+                MeshStreamFrame::Goodbye { .. } => {
+                    return Err(ReliableStreamError::UnexpectedFrame("goodbye"))
+                }
+                MeshStreamFrame::Hello(_) => {
+                    return Err(ReliableStreamError::UnexpectedFrame("hello"))
+                }
+                MeshStreamFrame::Gossip { .. } => {
+                    return Err(ReliableStreamError::UnexpectedFrame("gossip"))
+                }
+            }));
+        }
+
+        // Copied out so the borrow ends before the `&mut self` call below.
+        let (fenced, community_id) = {
+            let (fenced, frame) = self.pending.as_deref().expect("parked just above");
+            (*fenced, frame.community_id())
         };
 
-        match frame {
-            MeshStreamFrame::Data { fenced, payload } => {
-                let frame = ReliableWireFrame::decode(&payload)?;
-                let community_id = frame.community_id();
-                self.validate_frame_fence(directory, community_id, &fenced)
-                    .await?;
-                match frame {
-                    ReliableWireFrame::Data { payload, .. } => {
-                        Ok(Some(ReliableFrame::Data(payload)))
-                    }
-                    ReliableWireFrame::Goodbye { reason, .. } => {
-                        Ok(Some(ReliableFrame::Goodbye(reason)))
-                    }
-                }
-            }
-            MeshStreamFrame::Goodbye { .. } => Err(ReliableStreamError::UnexpectedFrame("goodbye")),
-            MeshStreamFrame::Hello(_) => Err(ReliableStreamError::UnexpectedFrame("hello")),
-            MeshStreamFrame::Gossip { .. } => Err(ReliableStreamError::UnexpectedFrame("gossip")),
+        // The frame stays parked across this await. A cancellation here is
+        // what used to lose it; now the next call picks it up again.
+        if let Err(e) = self
+            .validate_frame_fence(directory, community_id, &fenced)
+            .await
+        {
+            // A frame that fails the fence is rejected, not retried: drop it
+            // so a caller that ignores the error cannot spin on it forever.
+            self.pending = None;
+            return Err(e);
         }
+
+        let (_, frame) = *self.pending.take().expect("parked just above");
+        Ok(Some(match frame {
+            ReliableWireFrame::Data { payload, .. } => ReliableFrame::Data(payload),
+            ReliableWireFrame::Goodbye { reason, .. } => ReliableFrame::Goodbye(reason),
+        }))
     }
 
     async fn validate_frame_fence(
@@ -658,7 +696,9 @@ fn spawn_lease_renewer_with_interval(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Mutex;
+    use std::task::{Context, Waker};
 
     use buzz_relay_mesh::endpoint::MeshEndpoint;
     use buzz_relay_mesh::{InboundHandler, MeshDatagram, PeerInfo};
@@ -848,6 +888,114 @@ mod tests {
                     profile: Profile::ReliableStream,
                 },
             })
+        );
+    }
+
+    /// A cancelled `recv_validated` must not swallow the frame it already
+    /// took off the wire.
+    ///
+    /// Validating the fence is a Redis round trip, so there is an await point
+    /// between "frame decoded" and "frame validated". Both callers cancel at
+    /// that point in normal operation (`run_demo_echo`'s `select!` ticker and
+    /// `api::mesh_demo`'s `timeout`). Before the frame was parked on the
+    /// stream, a cancellation there dropped it permanently and the next call
+    /// blocked forever on a frame the peer had already sent — the join-side
+    /// probe then failed its 10s echo timeout with a 504.
+    ///
+    /// The cancellation is driven by polling the call exactly once by hand.
+    /// `tokio::time::timeout(Duration::ZERO, ..)` is NOT equivalent and was
+    /// wrong here: tokio's `Timeout` polls the inner future before the expired
+    /// timer, so when the runtime polls the task a second time — after the
+    /// reactor has delivered the Redis response — the whole call completes and
+    /// nothing is ever cancelled. That made the first version of this test pass
+    /// locally and fail on CI. A single manual poll gives the reactor no chance
+    /// to run between the frame read and the fence await, so the fence is
+    /// guaranteed pending and the cancellation lands exactly where the bug used
+    /// to lose the frame.
+    #[tokio::test]
+    async fn cancelled_recv_validated_keeps_the_frame_it_already_read() {
+        let Some(directory) = redis_directory_if_available().await else {
+            return;
+        };
+        let community_id = community();
+        let session_id = Uuid::new_v4();
+        clear_keys(&directory, community_id, session_id).await;
+
+        let (sender_endpoint, owner_endpoint) = endpoint_pair().await;
+        let owner_runtime = owner_endpoint.runtime_id();
+        let owner_addr = owner_endpoint.addr();
+        let accept_endpoint = owner_endpoint.clone();
+        let accept = tokio::spawn(async move { accept_endpoint.accept().await.unwrap().unwrap() });
+        let sender_peer = sender_endpoint.connect(owner_addr).await.unwrap();
+        let owner_peer = accept.await.unwrap();
+
+        let lease = match directory
+            .acquire(
+                community_id,
+                session_id,
+                owner_runtime,
+                Profile::ReliableStream,
+            )
+            .await
+            .unwrap()
+        {
+            AcquireResult::Acquired(lease) => lease,
+            AcquireResult::Exists(_) => panic!("fresh session should acquire"),
+        };
+        let fenced = lease.fenced_header();
+
+        let accept_bi = tokio::spawn(async move { owner_peer.accept_bi().await.unwrap() });
+        let mut sender = ReliableMeshStream::new(fenced, sender_peer.open_bi().await.unwrap())
+            .with_community(community_id);
+        // open_bi is lazy on the wire: send first so the peer sees the stream.
+        sender
+            .send_bytes(community_id, b"cancel-safety")
+            .await
+            .unwrap();
+        let mut receiver = ReliableMeshStream::new_inbound(fenced, accept_bi.await.unwrap());
+
+        // The frame has to be readable before a single poll can get past the
+        // read and reach the fence await. Rather than assume one fixed sleep is
+        // enough — it is not, on a loaded runner — poll-and-cancel in a bounded
+        // loop until the park is observed, sleeping between attempts so the
+        // reactor can deliver the datagram. Each iteration is itself a
+        // cancellation, so a build that loses the frame never parks it and the
+        // loop runs out.
+        let mut parked = false;
+        for _ in 0..50 {
+            {
+                let mut call = std::pin::pin!(receiver.recv_validated(&directory));
+                let mut cx = Context::from_waker(Waker::noop());
+                // A single poll cannot finish the Redis round trip, because the
+                // reactor does not run inside it. Anything but `Pending` means
+                // this test is no longer exercising the fence await.
+                assert!(
+                    call.as_mut().poll(&mut cx).is_pending(),
+                    "one poll must not finish the call: it has to reach the fence await"
+                );
+            }
+            // Dropping `call` above IS the cancellation.
+            if receiver.pending.is_some() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            parked,
+            "the cancelled call must leave the decoded frame parked on the stream"
+        );
+
+        let frame =
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv_validated(&directory))
+                .await
+                .expect("resumed call should not time out")
+                .expect("resumed call should succeed")
+                .expect("a frame should still be available");
+        assert_eq!(frame, ReliableFrame::Data(b"cancel-safety".to_vec()));
+        assert!(
+            receiver.pending.is_none(),
+            "a validated frame must be consumed, not left parked"
         );
     }
 

@@ -30,6 +30,18 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
     { id = "RUSTSEC-2026-0368", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
     { id = "RUSTSEC-2026-0369", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
+    # zip 2.4.2: `ZipArchive::extract` sizes the symlink-target buffer from the
+    # entry's *declared* uncompressed size before reading any entry data, so a
+    # crafted archive aborts the process on allocation failure. Availability only.
+    # Same crate, same path and same ceiling as 0367-0369 above: the fix is in
+    # zip >= 9, which this mesh-llm pin does not reach.
+    #
+    # Nothing in the workspace extracts an archive on a production path. zip is
+    # reachable only through buzz-relay's [dev-dependencies] —
+    # `cargo tree --workspace --edges normal --target all -i zip` prints
+    # "nothing to print" on every target. Remove this when mesh-llm moves to
+    # zip >= 9, together with 0367-0369.
+    { id = "RUSTSEC-2026-0429", reason = "zip 2.4.2 via mesh-llm v0.73.1; dev-dependency only; no zip>=9 at this mesh-llm pin" },
 ]
 
 [licenses]
