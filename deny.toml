@@ -42,6 +42,20 @@ ignore = [
     # "nothing to print" on every target. Remove this when mesh-llm moves to
     # zip >= 9, together with 0367-0369.
     { id = "RUSTSEC-2026-0429", reason = "zip 2.4.2 via mesh-llm v0.73.1; dev-dependency only; no zip>=9 at this mesh-llm pin" },
+
+    # rmcp < 3.9.0: Streamable HTTP clients buffer response bodies without a
+    # size limit (0462). Every workspace crate that uses rmcp directly
+    # (buzz-dev-mcp via the workspace dep, buzz-agent) is on rmcp >= 3.9.
+    # The remaining rmcp 1.7.0 arrives only on a dev edge — mesh-llm v0.73.1
+    # (mesh-llm-host-runtime / mesh-llm-plugin require rmcp ^1.2) —
+    # reachable solely through buzz-relay's [dev-dependencies]:
+    # `cargo tree --workspace --edges normal --target all -i rmcp@1.7.0`
+    # prints nothing. mesh-llm moved to rmcp 3 in v0.76.2, but that tag needs
+    # rusqlite 0.40 (libsqlite3-sys ^0.38), which conflicts with sqlx 0.9's
+    # libsqlite3-sys pin, so the bump is a separate change (upstream did it by
+    # splitting the smoke harnesses into buzz-mesh-smoke). The [bans] fence
+    # below keeps any other consumer from pulling an unpatched rmcp.
+    { id = "RUSTSEC-2026-0462", reason = "rmcp 1.7.0 only via mesh-llm v0.73.1 dev-dependency; workspace rmcp consumers on >= 3.9; no rmcp 3 at this mesh-llm pin" },
 ]
 
 [licenses]
@@ -117,3 +131,6 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+deny = [
+    { name = "rmcp", version = "<3.9.0", wrappers = ["mesh-llm-host-runtime", "mesh-llm-plugin"], reason = "RUSTSEC-2026-0462: only the dev-only mesh-llm v0.73.1 pin may pull unpatched rmcp; everything else must use rmcp >= 3.9.0" },
+]

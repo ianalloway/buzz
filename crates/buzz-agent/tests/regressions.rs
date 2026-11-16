@@ -372,7 +372,12 @@ async fn tool_metadata_caps_enforced() {
                 "args": [],
                 "env": [
                     { "name": "FAKE_MCP_TOOL_COUNT", "value": "200" },
-                    { "name": "FAKE_MCP_HUGE_DESC", "value": "1" },
+                    // 200 x 50 KB keeps the tools/list response (~10 MB) under
+                    // rmcp 3's 16 MiB stdio line cap (DEFAULT_MAX_LINE_LENGTH);
+                    // FAKE_MCP_HUGE_DESC (200 x 100 KB) is now dropped by the
+                    // transport before our own caps run. Every description is
+                    // still far above the 1024-byte cap under test.
+                    { "name": "FAKE_MCP_DESC_SIZE", "value": "50000" },
                 ],
             }],
         }),
