@@ -909,11 +909,11 @@ pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
 /// with a marker; text is middle-elided so the head (what ran) and tail
 /// (how it ended) both survive. Every elision leaves an inline marker.
 fn tool_result_content(
-    blocks: &[rmcp::model::Content],
+    blocks: &[rmcp::model::ContentBlock],
     max_bytes: usize,
     max_text_bytes: usize,
 ) -> Vec<ToolResultContent> {
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     let mut out = Vec::new();
     let mut text = String::new();
     let mut used = 0usize; // total bytes emitted (text + images)
@@ -947,9 +947,9 @@ fn tool_result_content(
     };
 
     for c in blocks {
-        match &c.raw {
-            RawContent::Text(t) => append(&mut text, &t.text),
-            RawContent::Image(i) => {
+        match c {
+            ContentBlock::Text(t) => append(&mut text, &t.text),
+            ContentBlock::Image(i) => {
                 flush_text(&mut out, &mut text, &mut used, &mut text_used);
                 let image_bytes = i.data.len().saturating_add(i.mime_type.len());
                 if used.saturating_add(image_bytes) <= max_bytes {
@@ -969,7 +969,7 @@ fn tool_result_content(
                     );
                 }
             }
-            RawContent::Audio(a) => append(
+            ContentBlock::Audio(a) => append(
                 &mut text,
                 &format!(
                     "[audio elided: {}, {} bytes]",
@@ -977,10 +977,12 @@ fn tool_result_content(
                     a.data.len()
                 ),
             ),
-            RawContent::ResourceLink(r) => {
+            ContentBlock::ResourceLink(r) => {
                 append(&mut text, &format!("[resource: {}]", short(&r.uri)));
             }
-            RawContent::Resource(_) => append(&mut text, "[resource elided]"),
+            ContentBlock::Resource(_) => append(&mut text, "[resource elided]"),
+            // ContentBlock is #[non_exhaustive] in rmcp 3.
+            _ => append(&mut text, "[unsupported content elided]"),
         }
     }
     flush_text(&mut out, &mut text, &mut used, &mut text_used);
@@ -995,7 +997,7 @@ mod content_tests {
     fn passthrough_includes_buzz_owner_attestation() {
         assert!(PASSTHROUGH_ENV.contains(&"BUZZ_AUTH_TAG"));
     }
-    use rmcp::model::Content;
+    use rmcp::model::ContentBlock;
 
     #[cfg(windows)]
     #[test]
@@ -1019,9 +1021,9 @@ mod content_tests {
     #[test]
     fn tool_result_content_preserves_images() {
         let blocks = vec![
-            Content::text("header"),
-            Content::image("aW1n", "image/png"),
-            Content::text("tail"),
+            ContentBlock::text("header"),
+            ContentBlock::image("aW1n", "image/png"),
+            ContentBlock::text("tail"),
         ];
         let out = tool_result_content(&blocks, 1024, 1024);
         assert_eq!(out.len(), 3);
@@ -1036,7 +1038,7 @@ mod content_tests {
 
     #[test]
     fn tool_result_content_elides_images_over_budget() {
-        let blocks = vec![Content::image("a".repeat(300), "image/png")];
+        let blocks = vec![ContentBlock::image("a".repeat(300), "image/png")];
         let out = tool_result_content(&blocks, 256, 256);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], ToolResultContent::Text(t) if t.contains("image elided")));
@@ -1048,7 +1050,7 @@ mod content_tests {
         for i in 0..5000 {
             body.push_str(&format!("line {i}\n"));
         }
-        let blocks = vec![Content::text(body.clone())];
+        let blocks = vec![ContentBlock::text(body.clone())];
         let out = tool_result_content(&blocks, 1024 * 1024, 4096);
         assert_eq!(out.len(), 1);
         let ToolResultContent::Text(t) = &out[0] else {
@@ -1065,7 +1067,7 @@ mod content_tests {
 
     #[test]
     fn text_within_budget_is_untouched() {
-        let blocks = vec![Content::text("short output")];
+        let blocks = vec![ContentBlock::text("short output")];
         let out = tool_result_content(&blocks, 1024 * 1024, 4096);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], ToolResultContent::Text(t) if t == "short output"));
@@ -1076,8 +1078,8 @@ mod content_tests {
         let big_text = "x".repeat(10_000);
         let img = "a".repeat(100_000);
         let blocks = vec![
-            Content::text(big_text),
-            Content::image(img.clone(), "image/png"),
+            ContentBlock::text(big_text),
+            ContentBlock::image(img.clone(), "image/png"),
         ];
         let out = tool_result_content(&blocks, 8 * 1024 * 1024, 4096);
         assert_eq!(out.len(), 2);
