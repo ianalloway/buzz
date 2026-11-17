@@ -931,6 +931,13 @@ jobs:
         run: cd mobile && flutter analyze
       - name: Test
         run: cd mobile && flutter test
+      # ubuntu-latest now defaults to JDK 25, which Gradle 8.14 does not
+      # support ("What went wrong: 25.0.5"). Pin JDK 17, matching upstream.
+      - name: Set up JDK 17
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Build Android debug APK
         run: just mobile-build-android
 
