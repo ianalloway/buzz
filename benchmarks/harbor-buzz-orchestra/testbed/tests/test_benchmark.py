@@ -16,6 +16,9 @@ _spec.loader.exec_module(benchmark)
 
 @pytest.fixture
 def state_dir(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("BUZZ_BENCHMARK_STATE_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(benchmark, "STATE_DIR", tmp_path / ".benchmark")
     return tmp_path / ".benchmark"
 
@@ -55,8 +58,37 @@ def test_state_is_generated_once_and_reused(state_dir):
     assert first["user_secret_key"] == second["user_secret_key"]
     assert first["owner_secret_key"] != first["user_secret_key"]
     assert len(first["user_pubkey"]) == 64
-    stored = json.loads((state_dir / "state.json").read_text())
-    assert "user_pubkey" not in stored  # derived, never persisted
+    from harbor_buzz_testbed.credential_state import read_state
+
+    path = state_dir / "state.json"
+    assert first["user_secret_key"].encode() not in path.read_bytes()
+    assert "user_pubkey" not in read_state(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_state_preserves_identities_during_migration(state_dir):
+    from harbor_buzz_testbed.credential_state import read_state
+
+    original = benchmark.load_state()
+    path = state_dir / "state.json"
+    legacy = {name: value for name, value in original.items() if not name.endswith("_pubkey")}
+    path.write_text(json.dumps(legacy))
+    assert benchmark.load_state() == original
+    assert read_state(path) == legacy
+    assert original["owner_secret_key"].encode() not in path.read_bytes()
+
+
+def test_legacy_configs_are_removed_before_provider_validation(state_dir):
+    state_dir.mkdir()
+    env = state_dir / ".env"
+    config = state_dir / "provisioner.json"
+    env.write_text("POSTGRES_PASSWORD=fixture")
+    config.write_text(json.dumps({"llm_api_keys": {"model": "fixture"}}))
+    benchmark.remove_legacy_configs()
+    assert not env.exists() and not config.exists()
+    config.write_text(json.dumps({"benchmark_state_file": "state.json"}))
+    benchmark.remove_legacy_configs()
+    assert config.exists()
 
 
 def test_provisioner_config_pins_user_and_keeps_channels(state_dir, tmp_path, monkeypatch):
@@ -66,11 +98,18 @@ def test_provisioner_config_pins_user_and_keeps_channels(state_dir, tmp_path, mo
         json.dumps({"model-a": {"provider": "anthropic", "api_key_env": "FAKE_KEY_ENV"}})
     )
     state = benchmark.load_state()
-    path = benchmark.write_provisioner_config(state, endpoints)
+    path = benchmark.write_provisioner_config(endpoints)
     config = json.loads(path.read_text())
-    assert config["user_secret_key"] == state["user_secret_key"]
+    from harbor_buzz_testbed.provisioner import provisioner_from_dict
+
+    resolved = provisioner_from_dict(config)._config
+    assert resolved.user_secret_key == state["user_secret_key"]
+    assert resolved.postgres_dsn == benchmark.postgres_dsn(state)
+    assert resolved.llm_api_keys == {"model-a": "sk-test"}
+    assert "sk-test" not in path.read_text()
+    assert state["owner_secret_key"] not in path.read_text()
     assert config["archive_on_teardown"] is False
-    assert config["llm_api_keys"] == {"model-a": "sk-test"}
+    assert config["llm_api_key_env"] == {"model-a": "FAKE_KEY_ENV"}
     assert str(benchmark.RELAY_HTTP_PORT) in config["relay_http_url"]
     # Both views dial the relay's canonical host-bound address; inside the
     # task container the loopback forwarder bridges it to the host gateway.
@@ -85,15 +124,13 @@ def test_provisioner_config_missing_api_key_is_explicit(state_dir, tmp_path, mon
         json.dumps({"model-a": {"provider": "x", "api_key_env": "MISSING_KEY_ENV"}})
     )
     with pytest.raises(SystemExit, match="MISSING_KEY_ENV"):
-        benchmark.write_provisioner_config(benchmark.load_state(), endpoints)
+        benchmark.write_provisioner_config(endpoints)
 
 
-def test_env_file_wires_owner_and_ports(state_dir):
+def test_compose_environment_wires_owner_and_ports(state_dir):
     state = benchmark.load_state()
-    env_path = benchmark.write_env_file(state)
-    env = dict(
-        line.split("=", 1) for line in env_path.read_text().splitlines() if line
-    )
+    env = benchmark.compose_environment(state)
+    assert not (state_dir / ".env").exists()
     assert env["RELAY_OWNER_PUBKEY"] == state["owner_pubkey"]
     assert env["BUZZ_HTTP_PORT"] == str(benchmark.RELAY_HTTP_PORT)
     assert env["BUZZ_PG_HOST_PORT"] == str(benchmark.PG_HOST_PORT)
@@ -109,17 +146,17 @@ def test_compose_command_isolates_the_project(state_dir):
     assert any(f.endswith("compose.benchmark.yml") for f in files)
 
 
-def test_bring_up_self_heals_a_stale_credential_volume(monkeypatch):
+def test_bring_up_self_heals_a_stale_credential_volume(monkeypatch, state_dir):
     calls = []
 
-    def fake_run(command, check=True):
+    def fake_run(command, check=True, env=None):
         calls.append(command)
         if len(calls) == 1:  # first up fails against the stale volume
             raise benchmark.subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
     monkeypatch.setattr(benchmark, "stale_credential_volume", lambda state: True)
-    benchmark.bring_up_stack({})
+    benchmark.bring_up_stack(benchmark.load_state())
     assert [c[-3:] for c in calls] == [
         ["up", "-d", "--wait"],
         [str(benchmark.COMPOSE_FILES[-1]), "down", "-v"],
@@ -127,20 +164,21 @@ def test_bring_up_self_heals_a_stale_credential_volume(monkeypatch):
     ]
 
 
-def test_bring_up_reraises_unrelated_failures(monkeypatch):
-    def fake_run(command, check=True):
+def test_bring_up_reraises_unrelated_failures(monkeypatch, state_dir):
+    def fake_run(command, check=True, env=None):
         raise benchmark.subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
     monkeypatch.setattr(benchmark, "stale_credential_volume", lambda state: False)
     with pytest.raises(benchmark.subprocess.CalledProcessError):
-        benchmark.bring_up_stack({})
+        benchmark.bring_up_stack(benchmark.load_state())
 
 
-def test_fresh_resets_volumes_and_gui_state(tmp_path, monkeypatch):
+def test_fresh_resets_volumes_and_gui_state(tmp_path, monkeypatch, state_dir):
+    state = benchmark.load_state()
     commands = []
     monkeypatch.setattr(
-        benchmark.subprocess, "run", lambda cmd, check=True: commands.append(cmd)
+        benchmark.subprocess, "run", lambda cmd, check=True, env=None: commands.append(cmd)
     )
     monkeypatch.setattr(benchmark.sys, "platform", "darwin")
     monkeypatch.setattr(benchmark.Path, "home", classmethod(lambda cls: tmp_path))
@@ -148,7 +186,7 @@ def test_fresh_resets_volumes_and_gui_state(tmp_path, monkeypatch):
     gui_state.mkdir(parents=True)
     (gui_state / "localstorage.sqlite3").touch()
 
-    benchmark.reset_environment()
+    benchmark.reset_environment(state)
 
     assert ["down", "-v"] == commands[0][-2:]
     assert not gui_state.exists()

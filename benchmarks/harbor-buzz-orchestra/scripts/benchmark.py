@@ -141,14 +141,12 @@ def load_state() -> dict[str, str]:
     """Generate-or-load the benchmark environment's keys and secrets."""
     from harbor_buzz_testbed.keys import generate_keypair, keypair_from_secret
 
-    STATE_DIR.mkdir(mode=0o700, exist_ok=True)
-    state_path = STATE_DIR / "state.json"
-    if state_path.is_file():
-        state = json.loads(state_path.read_text())
-    else:
+    from harbor_buzz_testbed.credential_state import load_or_create_state
+
+    def generate() -> dict[str, str]:
         owner = generate_keypair()
         user = generate_keypair()
-        state = {
+        return {
             "owner_secret_key": owner.secret_key,
             "user_secret_key": user.secret_key,
             "postgres_password": secrets.token_urlsafe(24),
@@ -159,8 +157,8 @@ def load_state() -> dict[str, str]:
             "git_hook_hmac_secret": secrets.token_hex(32),
             "relay_private_key": generate_keypair().secret_key,
         }
-        state_path.touch(mode=0o600)
-        state_path.write_text(json.dumps(state, indent=2))
+
+    state = load_or_create_state(STATE_DIR / "state.json", generate)
     state["owner_pubkey"] = keypair_from_secret(state["owner_secret_key"]).pubkey
     state["user_pubkey"] = keypair_from_secret(state["user_secret_key"]).pubkey
     return state
@@ -179,10 +177,10 @@ def print_user_identity(state: dict[str, str]) -> None:
     )
 
 
-def write_env_file(state: dict[str, str]) -> Path:
-    """Compose interpolation env — regenerated from state on every run."""
-    env_path = STATE_DIR / ".env"
-    lines = {
+def compose_environment(state: dict[str, str]) -> dict[str, str]:
+    """Pass Compose interpolation values directly to its child process."""
+    return {
+        **os.environ,
         "BUZZ_IMAGE": os.environ.get("BUZZ_IMAGE", "ghcr.io/block/buzz:main"),
         "BUZZ_DOMAIN": "localhost",
         "RELAY_URL": f"ws://localhost:{RELAY_HTTP_PORT}",
@@ -210,9 +208,6 @@ def write_env_file(state: dict[str, str]) -> Path:
         "BUZZ_PG_HOST_PORT": str(PG_HOST_PORT),
         "BUZZ_METRICS_HOST_PORT": str(METRICS_HOST_PORT),
     }
-    env_path.touch(mode=0o600)
-    env_path.write_text("".join(f"{k}={v}\n" for k, v in lines.items()))
-    return env_path
 
 
 def postgres_dsn(state: dict[str, str]) -> str:
@@ -222,21 +217,19 @@ def postgres_dsn(state: dict[str, str]) -> str:
     )
 
 
-def write_provisioner_config(
-    state: dict[str, str], endpoint_config: Path
-) -> Path:
-    """Resolve per-endpoint API keys from the environment and write the
-    provisioner config: pinned user, keep-channels teardown."""
+def write_provisioner_config(endpoint_config: Path) -> Path:
+    """Write endpoint key references for the local testbed provisioner."""
+    from harbor_buzz_testbed.credential_state import atomic_write
+
     endpoints = json.loads(endpoint_config.read_text())
-    llm_api_keys: dict[str, str] = {}
+    key_env_names: dict[str, str] = {}
     for name, entry in endpoints.items():
         env_var = entry["api_key_env"]
-        key = os.environ.get(env_var)
-        if not key:
+        if not os.environ.get(env_var):
             raise SystemExit(
                 f"endpoint {name!r} needs the {env_var} environment variable"
             )
-        llm_api_keys[name] = key
+        key_env_names[name] = env_var
     config = {
         "relay_http_url": f"http://localhost:{RELAY_HTTP_PORT}",
         # The agents dial the relay's CANONICAL address — the relay is
@@ -245,15 +238,13 @@ def write_provisioner_config(
         # loopback address is served by a tiny forwarder bridging to the
         # Docker host gateway (see --relay-gateway below).
         "relay_ws_url": f"ws://localhost:{RELAY_HTTP_PORT}",
-        "owner_secret_key": state["owner_secret_key"],
-        "postgres_dsn": postgres_dsn(state),
-        "llm_api_keys": llm_api_keys,
-        "user_secret_key": state["user_secret_key"],
+        "benchmark_state_file": str((STATE_DIR / "state.json").resolve()),
+        "postgres_port": PG_HOST_PORT,
+        "llm_api_key_env": key_env_names,
         "archive_on_teardown": False,
     }
     path = STATE_DIR / "provisioner.json"
-    path.touch(mode=0o600)
-    path.write_text(json.dumps(config, indent=2))
+    atomic_write(path, json.dumps(config, indent=2).encode())
     return path
 
 
@@ -265,7 +256,7 @@ def compose_command(*args: str) -> list[str]:
         "docker", "compose",
         "--project-name", COMPOSE_PROJECT,
         "--project-directory", str(STATE_DIR),
-        "--env-file", str(STATE_DIR / ".env"),
+        "--env-file", os.devnull,
     ]
     for file in COMPOSE_FILES:
         command += ["-f", str(file)]
@@ -291,7 +282,7 @@ def bring_up_stack(state: dict[str, str]) -> None:
     that volume is usable (we can't even authenticate to it), so drop the
     volumes and retry once rather than aborting with instructions."""
     try:
-        subprocess.run(compose_command("up", "-d", "--wait"), check=True)
+        subprocess.run(compose_command("up", "-d", "--wait"), env=compose_environment(state), check=True)
     except subprocess.CalledProcessError:
         if not stale_credential_volume(state):
             raise
@@ -300,16 +291,16 @@ def bring_up_stack(state: dict[str, str]) -> None:
             "checkout's .benchmark/ state — dropping the stale volumes and "
             "retrying..."
         )
-        subprocess.run(compose_command("down", "-v"), check=True)
-        subprocess.run(compose_command("up", "-d", "--wait"), check=True)
+        subprocess.run(compose_command("down", "-v"), env=compose_environment(state), check=True)
+        subprocess.run(compose_command("up", "-d", "--wait"), env=compose_environment(state), check=True)
 
 
-def reset_environment() -> None:
+def reset_environment(state: dict[str, str]) -> None:
     """--fresh: drop the stack's Docker volumes and the benchmark GUI's
     app state, together — GUI records (workspaces, read state) only stay
     coherent as long as the database they reference exists. Keys in
     ``state.json`` are kept, so the same nsec works after the reset."""
-    subprocess.run(compose_command("down", "-v"), check=True)
+    subprocess.run(compose_command("down", "-v"), env=compose_environment(state), check=True)
     if sys.platform == "darwin":
         for domain in ("WebKit", "Caches", "Application Support"):
             shutil.rmtree(
@@ -432,6 +423,7 @@ def launch_gui(state: dict[str, str]) -> subprocess.Popen:
             "exec", "-T", "relay",
             "buzz-admin", "add-member", "--pubkey", state["user_pubkey"],
         ),
+        env=compose_environment(state),
         check=True,
     )
 
@@ -523,12 +515,21 @@ def leaderboard_argv(
     return argv
 
 
+def remove_legacy_configs() -> None:
+    """Remove generated plaintext even if provider validation later fails."""
+    (STATE_DIR / ".env").unlink(missing_ok=True)
+    path = STATE_DIR / "provisioner.json"
+    if path.exists() and "benchmark_state_file" not in json.loads(path.read_text()):
+        path.unlink(missing_ok=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     state = load_state()
-    print_user_identity(state)
-    write_env_file(state)
-    provisioner_config = write_provisioner_config(state, args.endpoint_config)
+    remove_legacy_configs()
+    if args.gui and sys.stdout.isatty():
+        print_user_identity(state)
+    provisioner_config = write_provisioner_config(args.endpoint_config)
 
     if args.dry_run:
         agent_bin_dir = LINUX_TARGET_DIR / linux_triple() / "release"
@@ -536,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
         ensure_binaries()
         agent_bin_dir = ensure_agent_binaries()
         if args.fresh:
-            reset_environment()
+            reset_environment(state)
         ensure_stack(state)
         if args.gui:
             launch_gui(state)
