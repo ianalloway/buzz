@@ -781,7 +781,7 @@ jobs:
         # schema.
         run: |
           cargo test --profile ci \
-            -p buzz-audit -p buzz-search -p buzz-media -p buzz-pubsub \
+            -p buzz-audit -p buzz-search -p buzz-media -p buzz-pubsub -p buzz-push-gateway \
             --lib -- --include-ignored --test-threads=1
           cargo test --profile ci -p buzz-search --test fts_integration \
             -- --include-ignored --test-threads=1
