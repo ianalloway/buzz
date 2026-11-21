@@ -111,7 +111,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 flate2 = "1"
 sherpa-onnx = "1.12"
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 axum = "0.8"
 rodio = "0.22"
 earshot = "1.0"
@@ -124,3 +124,9 @@ strip-ansi-escapes = "0.2"
 # `test-util` enables tokio's paused-clock (`start_paused`) so the relay
 # admission gate tests can assert exact wait durations without real sleeps.
 tokio = { version = "1", features = ["test-util"] }
+
+[patch.crates-io]
+keyring = { path = "../../vendor/keyring" }
+
+[patch."https://github.com/Mesh-LLM/mesh-llm.git"]
+mesh-llm-log-store = { path = "../../vendor/mesh-llm-log-store" }
