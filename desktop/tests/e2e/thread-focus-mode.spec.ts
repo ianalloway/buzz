@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 
+const threadReplyCount = 48;
+
 async function seedLongThread(page: import("@playwright/test").Page) {
   await expect
     .poll(() =>
@@ -10,7 +12,7 @@ async function seedLongThread(page: import("@playwright/test").Page) {
       ),
     )
     .toBe(true);
-  return page.evaluate(() => {
+  return page.evaluate((replyCount) => {
     const root = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
       channelName: "general",
       content: "Focus mode integration thread",
@@ -18,7 +20,7 @@ async function seedLongThread(page: import("@playwright/test").Page) {
     });
     if (!root) throw new Error("Failed to seed focus thread root");
 
-    for (let index = 0; index < 48; index += 1) {
+    for (let index = 0; index < replyCount; index += 1) {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
         content: `Focus reply ${index}: this deliberately wraps across several lines so changing the thread measure causes real layout reflow.`,
@@ -27,7 +29,7 @@ async function seedLongThread(page: import("@playwright/test").Page) {
       });
     }
     return root.id;
-  });
+  }, threadReplyCount);
 }
 
 async function topVisibleMessageId(
@@ -181,6 +183,9 @@ test("focus and split preserve reading context and interaction ownership", async
     .toBe(true);
   await expect(channel).toHaveAttribute("inert", "");
 
+  await expect(body.locator("[data-message-id]")).toHaveCount(
+    threadReplyCount + 1,
+  );
   await body.evaluate((element) => {
     element.scrollTop = element.scrollHeight * 0.4;
     element.dispatchEvent(new Event("scroll", { bubbles: true }));
