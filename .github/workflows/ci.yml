@@ -1125,13 +1125,13 @@ jobs:
           touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
           touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
           touch "desktop/src-tauri/binaries/buzz-$TARGET"
-      # Mesh rev is derived from Cargo.lock so a dependency bump needs no
+      # Mesh rev is derived from the desktop Cargo.lock so a dependency bump needs no
       # lockstep edit here; the cache key tracks it automatically.
       - name: Resolve mesh-llm rev
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-host-runtime"); print(p["source"].rsplit("#", 1)[1])')
           [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
