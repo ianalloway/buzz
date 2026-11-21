@@ -8,18 +8,6 @@ ignore = [
     # paste 1.0.15 — unmaintained. Transitive dep: mesh-llm → iroh → netlink-* → paste.
     # No safe upgrade available; tracked for upstream (iroh/netlink) replacement.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via mesh-llm → iroh → netlink; no upstream fix available" },
-    # nostr-relay-pool 0.44.3 — unmaintained as a standalone crate; its
-    # functionality moved into nostr-sdk >= 0.45. Not a vulnerability: the
-    # advisory carries no patched version ("No safe upgrade is available"), so
-    # `cargo update` cannot clear it.
-    #
-    # This workspace does not depend on it. It arrives only on a dev edge —
-    # mesh-llm v0.73.1 (pinned git tag) → nostr-sdk 0.44.1 → nostr-relay-pool —
-    # reachable solely through buzz-relay's [dev-dependencies]:
-    # `cargo tree --workspace --edges normal --target all -i nostr-relay-pool`
-    # prints nothing on any target. Remove this when mesh-llm moves to
-    # nostr-sdk >= 0.45.
-    { id = "RUSTSEC-2026-0243", reason = "transitive via mesh-llm → nostr-sdk; dev-dependency only; folded into nostr-sdk >= 0.45, no upgrade available at this pin" },
     # unsafe-libyaml 0.2.11 — unmaintained (repository archived 2024-03-25), not a
     # vulnerability report. Transitive dep: serde_yaml → unsafe-libyaml. The serde_yaml_ng
     # fork uses the same crate, so removing it means migrating YAML parsing in
