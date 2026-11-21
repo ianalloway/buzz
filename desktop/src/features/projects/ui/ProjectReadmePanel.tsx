@@ -22,17 +22,17 @@ export function findReadmeFile(files: ProjectRepoFile[]) {
   return readmes.find((file) => !file.path.includes("/")) ?? readmes[0] ?? null;
 }
 
-function decodeHtmlEntities(value: string) {
-  return value
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
+const codeEntities: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+};
 
 function htmlInlineToMarkdown(value: string): string {
-  return decodeHtmlEntities(value)
+  // The Markdown renderer decodes prose entities after it identifies markup.
+  return value
     .replace(/<br\s*\/?\s*>/gi, "\n")
     .replace(/<img\b([^>]*)>/gi, (_match: string, attrs: string) => {
       const src = attrs.match(/\bsrc=["']([^"']+)["']/i)?.[1];
@@ -46,10 +46,25 @@ function htmlInlineToMarkdown(value: string): string {
     )
     .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**")
     .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*")
-    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, "`$1`")
     .replace(/<sub\b[^>]*>([\s\S]*?)<\/sub>/gi, "$1")
     .replace(/<span\b[^>]*>([\s\S]*?)<\/span>/gi, "$1")
-    .replace(/<[^>]+>/g, "")
+    .replace(
+      /<code\b[^>]*>([\s\S]*?)<\/code>|<[^>]+>/gi,
+      (_match: string, code: string | undefined) => {
+        if (code === undefined) return "";
+        // Code spans preserve entities verbatim, so decode their contents once.
+        const literal = code.replace(
+          /&(?:amp|lt|gt|quot|#39);/g,
+          (entity) => codeEntities[entity] ?? entity,
+        );
+        const runs = literal.match(/`+/g) ?? [];
+        const fence = "`".repeat(
+          runs.reduce((max, run) => Math.max(max, run.length), 0) + 1,
+        );
+        const pad = literal.startsWith("`") || literal.endsWith("`") ? " " : "";
+        return `${fence}${pad}${literal}${pad}${fence}`;
+      },
+    )
     .trim();
 }
 
