@@ -38,6 +38,7 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - 'vendor/**'
               - 'migrations/**'
               - 'schema/**'
               - 'Cargo.toml'
@@ -53,6 +54,7 @@ jobs:
               - 'pnpm-lock.yaml'
             desktop-rust:
               - 'desktop/src-tauri/**'
+              - 'vendor/**'
             web:
               - 'web/**'
               - 'pnpm-lock.yaml'
