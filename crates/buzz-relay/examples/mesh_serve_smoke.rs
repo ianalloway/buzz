@@ -1,6 +1,6 @@
 //! Local mesh-serve inference smoke test.
 //!
-//! Serves a GGUF model through the same `mesh_llm_sdk::serve` path Buzz
+//! Serves a GGUF model through the same `MeshNode::builder().serve()` path Buzz
 //! desktop uses in "Share compute" mode, then drives one chat completion
 //! against the node's local OpenAI-compatible endpoint. No mesh publish, no
 //! auto-join, no Nostr discovery — pure single-node serve-and-self-consume,
@@ -10,7 +10,8 @@
 //!   cargo run -p buzz-relay --example mesh_serve_smoke -- <path-to.gguf>
 use std::time::Duration;
 
-use mesh_llm_sdk::{serve, MeshDiscoveryMode};
+use mesh_llm_sdk::embedded_node::EmbeddedMeshDiscoveryMode;
+use mesh_llm_sdk::MeshNode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,24 +20,24 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: mesh_serve_smoke <path-to.gguf>"))?;
     eprintln!("[smoke] serving model: {model}");
 
-    let config = serve::EmbeddedServeConfig::builder()
+    let config = MeshNode::builder()
+        .serve()
         .model(&model)
         .api_port(19337)
         .console_port(13131)
         .publish(false)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         // NOTE: console_ui(true) is required here, not cosmetic. In mesh rev
-        // bd16da4, serve::start always polls `:console_port/api/status` to
+        // bd16da4, MeshNodeBuilder::start always polls `:console_port/api/status` to
         // confirm readiness, but the console HTTP server only binds when
         // !headless (i.e. console_ui == true). With console_ui(false) the
         // poll never succeeds and startup times out after 30s. Desktop's
         // Share-compute path sets console_ui(false) — likely hits the same
         // wall. Flagged to the team.
-        .console_ui(true)
-        .build();
+        .console_ui(true);
 
-    let node = serve::start(config).await?;
+    let node = config.start().await?;
     let base = node.api_base_url().to_string();
     eprintln!("[smoke] node up, api_base_url = {base}");
 

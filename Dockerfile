@@ -60,6 +60,7 @@ RUN apt-get update \
         git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /build/recipe.json recipe.json
+COPY vendor/ vendor/
 # Cook the full workspace recipe — relay deps include workspace siblings, so
 # scoping to -p buzz-relay misses transitive deps and re-builds them later.
 RUN cargo chef cook --release --recipe-path recipe.json

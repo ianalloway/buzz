@@ -117,7 +117,7 @@ url = "2"
 proptest = "1"
 
 # MCP SDK (used by buzz-dev-mcp and buzz-agent)
-rmcp = { version = "1.1.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
 schemars = { version = "1", default-features = false }
 
 # Internal crates
@@ -160,3 +160,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+keyring = { path = "vendor/keyring" }
+
+[patch."https://github.com/Mesh-LLM/mesh-llm.git"]
+mesh-llm-log-store = { path = "vendor/mesh-llm-log-store" }

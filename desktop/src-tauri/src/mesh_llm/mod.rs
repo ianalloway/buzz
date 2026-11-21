@@ -27,7 +27,10 @@ mod transport_policy;
 use transport_policy::iroh_relay_mode_from;
 use transport_policy::{iroh_relay_mode, validate_advertised_endpoint, IrohRelayMode};
 
-use mesh_llm_sdk::{client, serve, EmbeddedNodeHandle, MeshDiscoveryMode, TrustPolicy};
+use mesh_llm_host_runtime::sdk::{
+    start_embedded_node, EmbeddedMeshDiscoveryMode, EmbeddedMeshNodeConfig, EmbeddedMeshNodeHandle,
+    EmbeddedMeshNodeStatus, EmbeddedTrustPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -213,7 +216,7 @@ pub fn stopped_status() -> MeshNodeStatus {
 }
 
 pub struct DesktopMeshRuntime {
-    handle: EmbeddedNodeHandle,
+    handle: EmbeddedMeshNodeHandle,
     mode: MeshNodeMode,
     model_id: Option<String>,
     model_name: Option<String>,
@@ -249,8 +252,8 @@ async fn initialize_mesh_native_runtime() -> anyhow::Result<()> {
 pub const MESH_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Pre-download the model (with byte progress through the output sink)
-/// before the node starts. Without this the download happens *inside*
-/// `serve::start()` where the UI can only show a frozen "starting…" state.
+/// before the node starts. Without this the download happens during
+/// startup where the UI can only show a frozen "starting…" state.
 /// Already-installed models return immediately from the cache scan.
 async fn ensure_model_downloaded(model: &str) -> anyhow::Result<()> {
     let model_owned = model.to_string();
@@ -282,90 +285,56 @@ impl DesktopMeshRuntime {
         let model_name = model_id.clone();
         // Serve mode downloads weights before the node starts so byte
         // progress reaches the UI through the output sink; inside
-        // serve::start() the download is invisible.
+        // the SDK startup call the download is invisible.
         if request.mode == MeshNodeMode::Serve {
             if let Some(model) = model_id.as_deref() {
                 ensure_model_downloaded(model).await?;
             }
         }
-        let handle = match request.mode {
+        let mut builder = EmbeddedMeshNodeConfig::builder()
+            .api_port(mesh_api_port()?)
+            .console_port(mesh_console_port()?)
+            .console_ui(true)
+            .publish(false)
+            .auto_join(false)
+            .discovery_mode(EmbeddedMeshDiscoveryMode::Nostr)
+            .startup_timeout(MESH_STARTUP_TIMEOUT);
+        builder = match request.mode {
             MeshNodeMode::Serve => {
                 let model = model_id
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("modelId is required for serve mode"))?;
-                let mut builder = serve::EmbeddedServeConfig::builder()
-                    .model(model)
-                    .api_port(mesh_api_port()?)
-                    .console_port(mesh_console_port()?)
-                    // No-leak invariants: never publish mesh presence, never
-                    // auto-discover other meshes, no public Nostr relays.
-                    // Iroh relays are transport-only and enabled by default
-                    // (see MESH_IROH_RELAYS_ENV); everything else stays closed.
-                    .publish(false)
-                    .auto_join(false)
-                    .discovery_mode(MeshDiscoveryMode::Nostr)
-                    .startup_timeout(MESH_STARTUP_TIMEOUT)
-                    .console_ui(true);
-                builder = match iroh_relay_mode()? {
-                    IrohRelayMode::Disabled => builder.disable_iroh_relays(true),
-                    IrohRelayMode::Default => builder.disable_iroh_relays(false),
-                    IrohRelayMode::Custom(urls) => builder
-                        .disable_iroh_relays(false)
-                        .iroh_relays(urls.into_iter().map(|url| url.to_string())),
-                };
-                if let Some(max_vram_gb) = request.max_vram_gb {
-                    builder = builder.max_vram_gb(max_vram_gb as f64);
+                let builder = builder.serve().model(model);
+                match request.max_vram_gb {
+                    Some(limit) => builder.max_vram_gb(limit as f64),
+                    None => builder,
                 }
-                if let Some(join_token) = request.join_token.as_deref() {
-                    builder = builder.join_token(join_token);
-                }
-                // Admission: present our owner attestation, and when a member
-                // roster was resolved, admit only those owners. Membership in
-                // the Buzz relay is the source of the roster; possession of a
-                // dial pointer or relay reachability admits nobody.
-                let identity = ensure_owner_identity()?;
-                builder = builder.owner_key(identity.keystore_path.clone());
-                if let Some(owners) = normalized_roster(&request.trusted_owner_ids, &identity) {
-                    builder = builder
-                        .owner_required(true)
-                        .trust_policy(TrustPolicy::Allowlist)
-                        .trust_owners(owners);
-                }
-                serve::start(builder.build()).await?
             }
-            MeshNodeMode::Client => {
-                let mut builder = client::EmbeddedClientConfig::builder()
-                    .api_port(mesh_api_port()?)
-                    .console_port(mesh_console_port()?)
-                    // Same no-leak invariants as serve mode above.
-                    .publish(false)
-                    .auto_join(false)
-                    .discovery_mode(MeshDiscoveryMode::Nostr)
-                    .startup_timeout(MESH_STARTUP_TIMEOUT)
-                    .console_ui(true);
-                builder = match iroh_relay_mode()? {
-                    IrohRelayMode::Disabled => builder.disable_iroh_relays(true),
-                    IrohRelayMode::Default => builder.disable_iroh_relays(false),
-                    IrohRelayMode::Custom(urls) => builder
-                        .disable_iroh_relays(false)
-                        .iroh_relays(urls.into_iter().map(|url| url.to_string())),
-                };
-                if let Some(join_token) = request.join_token.as_deref() {
-                    builder = builder.join_token(join_token);
-                }
-                // Clients always present their owner attestation so allowlist
-                // enforcing serve nodes can verify and admit them.
-                let identity = ensure_owner_identity()?;
-                builder = builder.owner_key(identity.keystore_path.clone());
-                if let Some(owners) = normalized_roster(&request.trusted_owner_ids, &identity) {
-                    builder = builder
-                        .owner_required(true)
-                        .trust_policy(TrustPolicy::Allowlist)
-                        .trust_owners(owners);
-                }
-                client::start(builder.build()).await?
-            }
+            MeshNodeMode::Client => builder.client(),
         };
+        // Iroh relays are transport only. Neither mode publishes presence or
+        // automatically discovers peers.
+        builder = match iroh_relay_mode()? {
+            IrohRelayMode::Disabled => builder.disable_iroh_relays(true),
+            IrohRelayMode::Default => builder.disable_iroh_relays(false),
+            IrohRelayMode::Custom(urls) => builder
+                .disable_iroh_relays(false)
+                .iroh_relays(urls.into_iter().map(|url| url.to_string())),
+        };
+        if let Some(join_token) = request.join_token.as_deref() {
+            builder = builder.join_token(join_token);
+        }
+        // Both modes present their owner attestation. The Buzz relay's roster
+        // controls admission when it has been resolved.
+        let identity = ensure_owner_identity()?;
+        builder = builder.owner_key(identity.keystore_path.clone());
+        if let Some(owners) = normalized_roster(&request.trusted_owner_ids, &identity) {
+            builder = builder
+                .owner_required(true)
+                .trust_policy(EmbeddedTrustPolicy::Allowlist)
+                .trust_owners(owners);
+        }
+        let handle = start_embedded_node(builder.build()).await?;
 
         Ok(Self {
             handle,
@@ -431,10 +400,7 @@ impl DesktopMeshRuntime {
         Ok(models_from_status_payload(Some(&status.payload)))
     }
 
-    fn status_from_sdk(
-        &self,
-        status: mesh_llm_sdk::EmbeddedNodeStatus,
-    ) -> anyhow::Result<MeshNodeStatus> {
+    fn status_from_sdk(&self, status: EmbeddedMeshNodeStatus) -> anyhow::Result<MeshNodeStatus> {
         let health = health_from_payload(&status.payload);
         let state = node_state_from_payload(self.mode, &health, &status.payload);
         let endpoint_id = endpoint_id_from_status(&status.payload, status.invite_token.as_deref());

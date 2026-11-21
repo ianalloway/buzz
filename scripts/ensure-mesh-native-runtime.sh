@@ -13,10 +13,13 @@ fi
 CACHE_DIR="${MESH_LLM_NATIVE_RUNTIME_CACHE_DIR:-$ROOT/.cache/mesh-llm-native-runtime}"
 OUT_DIR="${MESH_LLM_NATIVE_RUNTIME_OUT_DIR:-$ROOT/.cache/mesh-llm-native-runtime-artifacts}"
 
-metadata="$($ROOT/bin/cargo metadata --manifest-path "$ROOT/desktop/src-tauri/Cargo.toml" --features mesh-llm --format-version 1)"
+[[ "$CACHE_DIR" = /* ]] || CACHE_DIR="$PWD/$CACHE_DIR"
+[[ "$OUT_DIR" = /* ]] || OUT_DIR="$PWD/$OUT_DIR"
+
+metadata="$("$ROOT/bin/cargo" metadata --manifest-path "$ROOT/desktop/src-tauri/Cargo.toml" --features mesh-llm --format-version 1)"
 SDK_MANIFEST="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["manifest_path"] for p in data["packages"] if p["name"]=="mesh-llm-sdk"))' <<<"$metadata")"
-MESH_ROOT="$(cd "$(dirname "$SDK_MANIFEST")/../.." && pwd)"
-MESH_VERSION="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="mesh-llm-sdk"))' <<<"$metadata")"
+MESH_ROOT="$(git -C "$(dirname "$SDK_MANIFEST")" rev-parse --show-toplevel)"
+RUNTIME_VERSION="$(cat "$MESH_ROOT/skippy/crates/skippy-native-runtime/RUNTIME_VERSION")"
 
 case "$(uname -s)/$(uname -m)/$BACKEND" in
   Darwin/arm64/metal) RUNTIME_ID="meshllm-native-runtime-darwin-aarch64-metal" ;;
@@ -33,16 +36,17 @@ case "$(uname -s)/$(uname -m)/$BACKEND" in
   *) RUNTIME_ID="" ;;
 esac
 
-if [[ -n "$RUNTIME_ID" && -f "$CACHE_DIR/$MESH_VERSION/$RUNTIME_ID/manifest.json" ]]; then
+if [[ -n "$RUNTIME_ID" && -f "$CACHE_DIR/$RUNTIME_VERSION/$RUNTIME_ID/manifest.json" ]]; then
   printf '%s\n' "$CACHE_DIR"
   exit 0
 fi
 
-echo "Preparing MeshLLM native runtime ($BACKEND) for MeshLLM $MESH_VERSION..." >&2
+echo "Preparing MeshLLM native runtime ($BACKEND) release $RUNTIME_VERSION..." >&2
 runtime_dir="$(cd "$MESH_ROOT" && scripts/ci-prepare-native-runtime.sh "$OUT_DIR" "$BACKEND")"
-version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"].get("mesh_version") or "unknown")' "$runtime_dir/manifest.json")"
-id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["id"])' "$runtime_dir/manifest.json")"
-mkdir -p "$CACHE_DIR/$version"
-rm -rf "$CACHE_DIR/$version/$id"
-cp -a "$runtime_dir" "$CACHE_DIR/$version/$id"
+(
+  cd "$MESH_ROOT"
+  REPO_ROOT="$MESH_ROOT"
+  source scripts/lib/automation.sh
+  mesh_automation automation runtime-cache-install "$runtime_dir" "$CACHE_DIR" >&2
+)
 printf '%s\n' "$CACHE_DIR"

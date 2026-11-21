@@ -11,7 +11,7 @@
 //!      gate — the failure mode the 1024 preset cap protects against).
 //!   P4 agentic tool use     — agent + buzz-dev-mcp writes a file on disk.
 //!
-//! The serve node is the same `mesh_llm_sdk::serve` path Share-compute uses
+//! The serve node is the same `MeshNode::builder().serve()` path Share-compute uses
 //! (publish off, mdns, loopback). The agent legs spawn the real
 //! `buzz-agent` binary with the exact env vars the relay-mesh preset ships.
 //!
@@ -22,7 +22,8 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use mesh_llm_sdk::{serve, MeshDiscoveryMode};
+use mesh_llm_sdk::embedded_node::EmbeddedMeshDiscoveryMode;
+use mesh_llm_sdk::MeshNode;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -50,17 +51,18 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("host runtime init: {e}"))?;
 
     eprintln!("[e2e] starting serve node with {model} (loading may take a minute)...");
-    let cfg = serve::EmbeddedServeConfig::builder()
+    let cfg = MeshNode::builder()
+        .serve()
         .model(&model)
         .api_port(API_PORT)
         .console_port(CONSOLE_PORT)
         .publish(false)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         .console_ui(true) // readiness poll needs the console bound
-        .startup_timeout(Duration::from_secs(300))
-        .build();
-    let node = serve::start(cfg)
+        .startup_timeout(Duration::from_secs(300));
+    let node = cfg
+        .start()
         .await
         .map_err(|e| anyhow::anyhow!("serve start: {e}"))?;
     let base = node.api_base_url().to_string();

@@ -1,47 +1,18 @@
 [advisories]
 ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is used directly by Buzz and required by rmcp, Mesh-LLM and Xet. Remove after these crates use a maintained date library." },
+    { id = "RUSTSEC-2026-0542", reason = "Xet runtime uses humantime to parse configured durations. Remove when the resolved xet-runtime release replaces humantime." },
     # instant 0.1.13 — unmaintained crate. Transitive dep: nostr → instant.
     # Will be resolved when nostr crate updates its dependencies.
     { id = "RUSTSEC-2024-0384", reason = "transitive dep via nostr; no upstream fix available" },
     # paste 1.0.15 — unmaintained. Transitive dep: mesh-llm → iroh → netlink-* → paste.
     # No safe upgrade available; tracked for upstream (iroh/netlink) replacement.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via mesh-llm → iroh → netlink; no upstream fix available" },
-    # nostr-relay-pool 0.44.3 — unmaintained as a standalone crate; its
-    # functionality moved into nostr-sdk >= 0.45. Not a vulnerability: the
-    # advisory carries no patched version ("No safe upgrade is available"), so
-    # `cargo update` cannot clear it.
-    #
-    # This workspace does not depend on it. It arrives only on a dev edge —
-    # mesh-llm v0.73.1 (pinned git tag) → nostr-sdk 0.44.1 → nostr-relay-pool —
-    # reachable solely through buzz-relay's [dev-dependencies]:
-    # `cargo tree --workspace --edges normal --target all -i nostr-relay-pool`
-    # prints nothing on any target. Remove this when mesh-llm moves to
-    # nostr-sdk >= 0.45.
-    { id = "RUSTSEC-2026-0243", reason = "transitive via mesh-llm → nostr-sdk; dev-dependency only; folded into nostr-sdk >= 0.45, no upgrade available at this pin" },
     # unsafe-libyaml 0.2.11 — unmaintained (repository archived 2024-03-25), not a
     # vulnerability report. Transitive dep: serde_yaml → unsafe-libyaml. The serde_yaml_ng
     # fork uses the same crate, so removing it means migrating YAML parsing in
     # buzz-agent, buzz-persona, buzz-relay, buzz-workflow and desktop.
     { id = "RUSTSEC-2024-0449", reason = "transitive via serde_yaml; unmaintained, not vulnerable; removal needs a YAML parser migration" },
-    # zip 2.4.2: extraction keeps setuid/setgid bits (0367), creates symlinks that
-    # escape the destination (0368) and applies permissions through symlinks (0369).
-    # Path: mesh-llm v0.73.1 → mesh-llm-host-runtime / plugin-manager / system → zip.
-    # Upgrade to zip >=9 is not reachable at this mesh-llm pin; recheck on bump.
-    { id = "RUSTSEC-2026-0367", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
-    { id = "RUSTSEC-2026-0368", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
-    { id = "RUSTSEC-2026-0369", reason = "zip 2.4.2 via mesh-llm v0.73.1; pinned transitive; no zip>=9 at this mesh-llm pin" },
-    # zip 2.4.2: `ZipArchive::extract` sizes the symlink-target buffer from the
-    # entry's *declared* uncompressed size before reading any entry data, so a
-    # crafted archive aborts the process on allocation failure. Availability only.
-    # Same crate, same path and same ceiling as 0367-0369 above: the fix is in
-    # zip >= 9, which this mesh-llm pin does not reach.
-    #
-    # Nothing in the workspace extracts an archive on a production path. zip is
-    # reachable only through buzz-relay's [dev-dependencies] —
-    # `cargo tree --workspace --edges normal --target all -i zip` prints
-    # "nothing to print" on every target. Remove this when mesh-llm moves to
-    # zip >= 9, together with 0367-0369.
-    { id = "RUSTSEC-2026-0429", reason = "zip 2.4.2 via mesh-llm v0.73.1; dev-dependency only; no zip>=9 at this mesh-llm pin" },
 ]
 
 [licenses]

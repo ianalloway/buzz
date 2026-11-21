@@ -38,6 +38,7 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - 'vendor/**'
               - 'migrations/**'
               - 'schema/**'
               - 'Cargo.toml'
@@ -53,6 +54,7 @@ jobs:
               - 'pnpm-lock.yaml'
             desktop-rust:
               - 'desktop/src-tauri/**'
+              - 'vendor/**'
             web:
               - 'web/**'
               - 'pnpm-lock.yaml'
@@ -197,7 +199,8 @@ jobs:
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    # Playwright 1.60 provides Chromium for Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
@@ -336,7 +339,8 @@ jobs:
 
   desktop-e2e-integration-shard:
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
-    runs-on: ubuntu-latest
+    # Playwright 1.60 provides Chromium for Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
@@ -530,7 +534,8 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A cold build of the relay's test dependencies can take over 20 minutes.
+    timeout-minutes: 35
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     permissions:
@@ -931,8 +936,12 @@ jobs:
         run: cd mobile && flutter analyze
       - name: Test
         run: cd mobile && flutter test
-      - name: Build Android debug APK
-        run: just mobile-build-android
+      - name: Build Android debug APK with JDK 17
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64:?JDK 17 is required for the Android build}"
+          "$JAVA_HOME/bin/java" -version
+          flutter config --jdk-dir="$JAVA_HOME"
+          just mobile-build-android
 
   security:
     name: Security
@@ -1119,13 +1128,13 @@ jobs:
           touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
           touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
           touch "desktop/src-tauri/binaries/buzz-$TARGET"
-      # Mesh rev is derived from Cargo.lock so a dependency bump needs no
+      # Mesh rev is derived from the desktop Cargo.lock so a dependency bump needs no
       # lockstep edit here; the cache key tracks it automatically.
       - name: Resolve mesh-llm rev
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-host-runtime"); print(p["source"].rsplit("#", 1)[1])')
           [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
