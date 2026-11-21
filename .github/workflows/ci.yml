@@ -534,7 +534,8 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A cold build of the relay's test dependencies can take over 20 minutes.
+    timeout-minutes: 35
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     permissions:
