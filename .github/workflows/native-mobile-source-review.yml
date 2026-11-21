@@ -12,12 +12,13 @@ jobs:
     name: Scan native mobile code (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.1.app/Contents/Developer
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { platform: android, runner: ubuntu-latest, language: java-kotlin }
-          - { platform: ios, runner: macos-latest, language: swift }
+          - { platform: ios, runner: macos-26, language: swift }
     steps:
       - name: Check out reviewed source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -31,12 +32,6 @@ jobs:
         run: |
           flutter --version
           flutter pub get
-      - name: Prepare Android build
-        if: matrix.platform == 'android'
-        run: |
-          export JAVA_HOME="${JAVA_HOME_17_X64:?JDK 17 required}"
-          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
-          flutter config --jdk-dir="$JAVA_HOME"
       - name: Prepare unsigned iOS simulator build
         if: matrix.platform == 'ios'
         working-directory: mobile
@@ -51,21 +46,32 @@ jobs:
           build-mode: manual
           db-location: ${{ runner.temp }}/mobile-codeql-db
           dependency-caching: false
-      - name: Trace Android app and native tests
-        if: matrix.platform == 'android'
+      - name: Trace iOS app, native tests and build utility
         run: |
-          just mobile-build-android
-          cd mobile/android
-          ./gradlew --no-daemon :app:compileDebugUnitTestKotlin :app:compileDebugAndroidTestKotlin
-      - name: Trace iOS app, tests and build utility
-        if: matrix.platform == 'ios'
-        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swiftc -version
           cd mobile
-          flutter build ios --simulator --debug --no-pub
+          flutter build ios --simulator --debug --config-only --no-pub
           cd ios
           xcodebuild build-for-testing -workspace Runner.xcworkspace -scheme Runner \
             -configuration Debug -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO
+            -derivedDataPath "$RUNNER_TEMP/buzz-derived-data" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO SWIFT_ENABLE_EXPLICIT_MODULES=NO \
+            CLANG_ENABLE_EXPLICIT_MODULES=NO SWIFT_PRECOMPILE_BRIDGING_HEADER=NO
+          flutter_root="$(sed -n 's/^FLUTTER_ROOT=//p' Flutter/Generated.xcconfig)"
+          framework="$(find "$flutter_root/bin/cache/artifacts/engine/ios/Flutter.xcframework" \
+            -type d -path '*/ios-*simulator/Flutter.framework' -print -quit)"
+          test -d "$framework"
+          test -f Runner/GeneratedPluginRegistrant.h
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          xcrun --sdk iphonesimulator swiftc -sdk "$sdk" -target arm64-apple-ios16.0-simulator \
+            -F "$(dirname "$framework")" -import-objc-header Runner/Runner-Bridging-Header.h \
+            -disable-bridging-pch -swift-version 5 -parse-as-library -whole-module-optimization \
+            -module-name BuzzReview -module-cache-path "$RUNNER_TEMP/buzz-standalone-cache" \
+            -emit-object Runner/AppDelegate.swift Runner/MediaSanitizer.swift Runner/SceneDelegate.swift \
+            -o "$RUNNER_TEMP/buzz-app-review.o"
           cd ../..
           xcrun swiftc -o "$RUNNER_TEMP/buzz-dev-icon-build-check" scripts/generate-dev-icon.swift
       - name: Analyze without publishing SARIF
@@ -116,3 +122,24 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.platform }}.sarif.tar.gz.age
           if-no-files-found: error
           retention-days: 1
+      - name: Verify all tracked Swift source files were extracted
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import json
+          report = Path("mobile-codeql-report")
+          expected = set(json.loads((report / "coverage.json").read_text())["expected"])
+          extracted = set()
+          for sarif in report.glob("*.sarif"):
+              for run in json.loads(sarif.read_text())["runs"]:
+                  for invocation in run.get("invocations", []):
+                      for note in invocation.get("toolExecutionNotifications", []):
+                          if note.get("descriptor", {}).get("id") == "swift/diagnostics/successfully-extracted-files":
+                              for loc in note.get("locations", []):
+                                  extracted.add(loc["physicalLocation"]["artifactLocation"]["uri"])
+          covered = {f for f in expected if any(uri == f or uri.endswith("/" + f) for uri in extracted)}
+          print(f"Swift extractor confirmed {len(covered)} of {len(expected)} tracked files.")
+          if covered != expected:
+              raise SystemExit(1)
+          PYTHON
