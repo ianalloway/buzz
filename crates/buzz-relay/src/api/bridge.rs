@@ -11,15 +11,55 @@ use axum::{
     response::Json,
 };
 use base64::Engine;
+use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
+use crate::protocol::MAX_FILTERS_PER_REQ;
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
+
+/// Stop decoding filters at the same limit advertised for WebSocket REQ and COUNT.
+fn parse_bridge_filters<'de, T: Deserialize<'de>>(
+    body: &'de [u8],
+) -> Result<Vec<T>, (StatusCode, Json<Value>)> {
+    struct Filters<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for Filters<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an array of at most {MAX_FILTERS_PER_REQ} filters")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut filters = Vec::new();
+            while filters.len() < MAX_FILTERS_PER_REQ {
+                match seq.next_element()? {
+                    Some(filter) => filters.push(filter),
+                    None => return Ok(filters),
+                }
+            }
+            if seq.next_element::<IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom(format_args!(
+                    "maximum is {MAX_FILTERS_PER_REQ} filters"
+                )));
+            }
+            Ok(filters)
+        }
+    }
+
+    let mut decoder = serde_json::Deserializer::from_slice(body);
+    decoder
+        .deserialize_seq(Filters(std::marker::PhantomData))
+        .and_then(|filters| decoder.end().map(|()| filters))
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))
+}
 
 async fn enforce_http_admission(
     state: &AppState,
@@ -703,8 +743,7 @@ pub async fn query_events(
 
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
-    let raw_filters: Vec<Value> = serde_json::from_slice(&body)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let raw_filters: Vec<Value> = parse_bridge_filters(&body)?;
     let filters: Vec<nostr::Filter> = raw_filters
         .iter()
         .map(|v| serde_json::from_value(v.clone()))
@@ -1090,8 +1129,7 @@ pub async fn count_events(
     )
     .await?;
 
-    let filters: Vec<nostr::Filter> = serde_json::from_slice(&body)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let filters: Vec<nostr::Filter> = parse_bridge_filters(&body)?;
 
     // P-gated kinds enforcement — same as WS REQ and /query.
     let authed_pubkey_hex = pubkey.to_hex();
@@ -1897,6 +1935,48 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 mod tests {
     use super::*;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
+
+    #[test]
+    fn bridge_filter_batches_share_the_websocket_limit() {
+        let filters = vec![serde_json::json!({}); MAX_FILTERS_PER_REQ];
+        let body = serde_json::to_vec(&filters).unwrap();
+        assert_eq!(
+            parse_bridge_filters::<Value>(&body).unwrap().len(),
+            MAX_FILTERS_PER_REQ
+        );
+        assert_eq!(
+            parse_bridge_filters::<nostr::Filter>(&body).unwrap().len(),
+            MAX_FILTERS_PER_REQ
+        );
+
+        let mut over_limit = filters;
+        over_limit.push(serde_json::json!({}));
+        let body = serde_json::to_vec(&over_limit).unwrap();
+        assert_eq!(
+            parse_bridge_filters::<Value>(&body).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            parse_bridge_filters::<nostr::Filter>(&body).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn bridge_filter_batches_preserve_extensions_and_reject_trailing_data() {
+        let body = br#"[{"kinds":[1,7],"limit":2,"top_level":true},{"limit":5}]"#;
+        assert_eq!(
+            parse_bridge_filters::<Value>(body).unwrap(),
+            serde_json::from_slice::<Vec<Value>>(body).unwrap()
+        );
+        assert_eq!(
+            parse_bridge_filters::<nostr::Filter>(body).unwrap(),
+            serde_json::from_slice::<Vec<nostr::Filter>>(body).unwrap()
+        );
+        assert!(parse_bridge_filters::<Value>(b"[]").unwrap().is_empty());
+        assert!(parse_bridge_filters::<Value>(b"[] {}").is_err());
+        assert!(parse_bridge_filters::<nostr::Filter>(b"[false]").is_err());
+    }
 
     fn redis_pool() -> deadpool_redis::Pool {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
