@@ -64,7 +64,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-window-state = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = "2.14"
 tauri-plugin-process = "2"
 infer = "0.19"
 hex = "0.4"
@@ -109,7 +109,6 @@ uuid = { version = "1", features = ["v4", "v5"] }
 png = "0.18"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-zip = "8"
 flate2 = "1"
 sherpa-onnx = "1.12"
 regex = "1"
