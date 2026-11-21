@@ -931,10 +931,12 @@ jobs:
         run: cd mobile && flutter analyze
       - name: Test
         run: cd mobile && flutter test
-      - name: Select JDK 17 for the Android Gradle build
-        run: flutter config --jdk-dir="$JAVA_HOME_17_X64"
-      - name: Build Android debug APK
-        run: just mobile-build-android
+      - name: Build Android debug APK with JDK 17
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64:?JDK 17 is required for the Android build}"
+          "$JAVA_HOME/bin/java" -version
+          flutter config --jdk-dir="$JAVA_HOME"
+          just mobile-build-android
 
   security:
     name: Security
