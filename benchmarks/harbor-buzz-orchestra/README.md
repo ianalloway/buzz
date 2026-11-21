@@ -1,5 +1,12 @@
 # Harbor Buzz Orchestra
 
+The local benchmark keeps its reusable identities encrypted in `.benchmark/state.json`.
+The decryption key lives in the macOS Keychain or Linux Secret Service. On a
+headless host, provide a stable Fernet key through your secret manager in
+`BUZZ_BENCHMARK_STATE_KEY`. Keep that key when moving the state directory.
+The first run migrates existing state and keeps the same identities and passwords.
+Provider API keys are read from their configured environment variables at use time.
+
 A stock-Harbor custom agent that runs a manifest-defined team through the real
 Buzz stack. Harbor sees one `BuzzOrchestraAgent`; behind that adapter, one
 orchestrator and N workers coordinate over the production relay/Postgres.

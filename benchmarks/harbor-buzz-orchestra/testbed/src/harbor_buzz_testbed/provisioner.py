@@ -5,9 +5,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 import psycopg
 from harbor_buzz_orchestra.manifest import ExperimentManifest
@@ -46,6 +48,19 @@ class TestbedConfig:
 
 def provisioner_from_dict(config: dict[str, object]) -> "BuzzTrialProvisioner":
     """Harbor CLI factory for a JSON-decoded testbed configuration."""
+    if "benchmark_state_file" in config:
+        from .credential_state import read_state
+
+        config = dict(config)
+        state = read_state(Path(config.pop("benchmark_state_file")))
+        port = config.pop("postgres_port")
+        key_env = config.pop("llm_api_key_env")
+        config.update(
+            owner_secret_key=state["owner_secret_key"],
+            user_secret_key=state["user_secret_key"],
+            postgres_dsn=f"postgresql://buzz:{state['postgres_password']}@127.0.0.1:{port}/buzz",
+            llm_api_keys={name: os.environ[var] for name, var in key_env.items()},
+        )
     return BuzzTrialProvisioner(TestbedConfig(**config))
 
 
