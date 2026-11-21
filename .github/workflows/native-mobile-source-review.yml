@@ -1,0 +1,118 @@
+name: One-time native mobile security review
+
+on:
+  push:
+    branches: [security/mobile-source-review-20261121]
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Scan native mobile code (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: android, runner: ubuntu-latest, language: java-kotlin }
+          - { platform: ios, runner: macos-latest, language: swift }
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 8dd6c0477986b42708b725fa00d80d23b0a6405c
+          persist-credentials: false
+      - name: Activate pinned Flutter tools
+        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616
+      - name: Prepare Flutter dependencies
+        working-directory: mobile
+        run: |
+          flutter --version
+          flutter pub get
+      - name: Prepare Android build
+        if: matrix.platform == 'android'
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64:?JDK 17 required}"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          flutter config --jdk-dir="$JAVA_HOME"
+      - name: Prepare unsigned iOS simulator build
+        if: matrix.platform == 'ios'
+        working-directory: mobile
+        run: |
+          flutter precache --ios
+          cd ios
+          pod install
+      - name: Initialize CodeQL tracing
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: manual
+          db-location: ${{ runner.temp }}/mobile-codeql-db
+          dependency-caching: false
+      - name: Trace Android app and native tests
+        if: matrix.platform == 'android'
+        run: |
+          just mobile-build-android
+          cd mobile/android
+          ./gradlew --no-daemon :app:compileDebugUnitTestKotlin :app:compileDebugAndroidTestKotlin
+      - name: Trace iOS app, tests and build utility
+        if: matrix.platform == 'ios'
+        run: |
+          cd mobile
+          flutter build ios --simulator --debug --no-pub
+          cd ios
+          xcodebuild build-for-testing -workspace Runner.xcworkspace -scheme Runner \
+            -configuration Debug -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO
+          cd ../..
+          xcrun swiftc -o "$RUNNER_TEMP/buzz-dev-icon-build-check" scripts/generate-dev-icon.swift
+      - name: Analyze without publishing SARIF
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea
+        with:
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/mobile-codeql-report
+      - name: Record extraction and encrypt the local report
+        working-directory: ${{ runner.temp }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          AGE_RECIPIENT: age15qmrphplqe32c98m967pd4zke3avu6jxczvwfrnt00wewchhw5tqs6e6r2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, subprocess, zipfile
+          root=Path(os.environ["GITHUB_WORKSPACE"])
+          extensions=["kt"] if os.environ["PLATFORM"]=="android" else ["swift"]
+          scanned=set()
+          for src in Path("mobile-codeql-db").rglob("src.zip"):
+              with zipfile.ZipFile(src) as archive:
+                  scanned.update(archive.namelist())
+          files=subprocess.check_output(["git","-C",str(root),"ls-files"],text=True).splitlines()
+          wanted=[name for name in files if name.split(".")[-1] in extensions]
+          traced=[f for f in wanted if any(x==f or x.endswith("/"+f) for x in scanned)]
+          results={"sha":subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip(),
+                   "expected":wanted,"traced":traced,"not_traced":sorted(set(wanted)-set(traced))}
+          assert list(Path("mobile-codeql-report").glob("*.sarif"))
+          Path("mobile-codeql-report/coverage.json").write_text(json.dumps(results))
+          print(f"Found {len(traced)} of {len(wanted)} first-party native sources in extraction archives")
+          PY
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) target=linux-amd64; digest=cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10 ;;
+            Darwin/arm64) target=darwin-arm64; digest=e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5 ;;
+            Darwin/x86_64) target=darwin-amd64; digest=1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539 ;;
+            *) exit 1 ;;
+          esac
+          curl -fsSL --retry 3 "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-$target.tar.gz" -o age-tool.tar.gz
+          echo "$digest  age-tool.tar.gz" | shasum -a 256 -c -
+          tar -xzf age-tool.tar.gz age/age
+          tar -czf - -C mobile-codeql-report . | ./age/age -r "$AGE_RECIPIENT" -o "$PLATFORM.sarif.tar.gz.age"
+      - name: Retain only encrypted results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mobile-codeql-${{ matrix.platform }}
+          path: ${{ runner.temp }}/${{ matrix.platform }}.sarif.tar.gz.age
+          if-no-files-found: error
+          retention-days: 1
