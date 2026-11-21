@@ -1027,7 +1027,7 @@ dependencies = [
  "hex",
  "nix 0.31.3",
  "reqwest",
- "rmcp 1.8.0",
+ "rmcp",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5239,7 +5239,7 @@ dependencies = [
  "rand 0.10.2",
  "regex-lite",
  "reqwest",
- "rmcp 3.11.0",
+ "rmcp",
  "rpassword",
  "rustls",
  "ryu",
@@ -5385,7 +5385,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
- "rmcp 3.11.0",
+ "rmcp",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -7530,20 +7530,6 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "9.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
-dependencies = [
- "futures",
- "indexmap 2.14.0",
- "nix 0.31.3",
- "tokio",
- "tracing",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "process-wrap"
 version = "10.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
@@ -8239,26 +8225,6 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
-dependencies = [
- "async-trait",
- "chrono",
- "futures",
- "pin-project-lite",
- "process-wrap 9.1.0",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "rmcp"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "391f153431ab68664d946513ea0cb3edbca78eaf99c5a983036cacab6220d85b"
@@ -8276,7 +8242,7 @@ dependencies = [
  "pastey",
  "percent-encoding",
  "pin-project-lite",
- "process-wrap 10.0.1",
+ "process-wrap",
  "rand 0.10.2",
  "reqwest",
  "rmcp-macros",
