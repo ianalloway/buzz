@@ -26,7 +26,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use mesh_llm_host_runtime::crypto::{save_keystore, OwnerKeypair};
-use mesh_llm_sdk::{client, serve, MeshDiscoveryMode, TrustPolicy};
+use mesh_llm_sdk::embedded_node::{EmbeddedMeshDiscoveryMode, EmbeddedTrustPolicy};
+use mesh_llm_sdk::MeshNode;
 
 const DEFAULT_MODEL: &str = "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M";
 
@@ -56,11 +57,11 @@ fn env(name: &str) -> anyhow::Result<String> {
 
 async fn init_native_runtime() -> anyhow::Result<()> {
     let cache = mesh_llm_sdk::native_runtime::native_runtime_cache(None)?;
-    let current = mesh_llm_sdk::native_runtime::CURRENT_MESH_VERSION;
+    let current = mesh_llm_sdk::native_runtime::current_runtime_release();
     if !cache
         .installed()?
         .iter()
-        .any(|runtime| runtime.mesh_version == current)
+        .any(|runtime| runtime.release_version == current)
     {
         anyhow::bail!("MeshLLM native runtime for MeshLLM {current} is not installed; run `just mesh-e2e-hardware` once to prepare it");
     }
@@ -80,24 +81,24 @@ async fn role_serve() -> anyhow::Result<()> {
         .map(str::to_string)
         .collect();
 
-    let cfg = serve::EmbeddedServeConfig::builder()
+    let cfg = MeshNode::builder()
+        .serve()
         .model(&model)
         .api_port(SERVE_API_PORT)
         .console_port(SERVE_CONSOLE_PORT)
         .publish(true)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         .console_ui(true)
         .startup_timeout(Duration::from_secs(600))
         .owner_key(owner_key)
         .owner_required(true)
-        .trust_policy(TrustPolicy::Allowlist)
+        .trust_policy(EmbeddedTrustPolicy::Allowlist)
         .trust_owners(trust_owners)
         // Require signed bootstrap tokens so owner admission is enforced from
         // the first connection attempt.
-        .signed_join_tokens(true)
-        .build();
-    let node = serve::start(cfg).await?;
+        .signed_join_tokens(true);
+    let node = cfg.start().await?;
     let invite = node
         .invite_token()
         .map(str::to_string)
@@ -127,12 +128,13 @@ async fn role_client() -> anyhow::Result<()> {
     let console_port: u16 = env("MESH_CONSOLE_PORT")?.parse()?;
     let window_secs: u64 = env("MESH_WINDOW_SECS")?.parse()?;
 
-    let cfg = client::EmbeddedClientConfig::builder()
+    let cfg = MeshNode::builder()
+        .client()
         .api_port(api_port)
         .console_port(console_port)
         .publish(false)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         .join_token(&join_token)
         .startup_timeout(Duration::from_secs(180))
         .console_ui(true)
@@ -140,9 +142,8 @@ async fn role_client() -> anyhow::Result<()> {
         // failure abort loudly instead of silently starting unattested
         // (which the allowlist serve would then reject as NoAttestation).
         .owner_key(owner_key)
-        .owner_required(true)
-        .build();
-    let node = client::start(cfg).await?;
+        .owner_required(true);
+    let node = cfg.start().await?;
     let http = reqwest::Client::new();
     let base = node.api_base_url().to_string();
     let seen = wait_for_model(&http, &base, Duration::from_secs(window_secs)).await?;

@@ -3,10 +3,10 @@
 //! Proves the full Buzz shared compute serve→consume path on a single box,
 //! without a relay or Nostr discovery:
 //!
-//!   1. Start a SERVE node hosting a GGUF (the `serve::start` path desktop
+//!   1. Start a SERVE node hosting a GGUF (the `MeshNodeBuilder::start` path desktop
 //!      uses in Share-compute mode), and read its mesh invite token.
 //!   2. Start a CLIENT node joined to that serve node via the invite token
-//!      (the `client::start` path a Buzz shared compute agent uses), binding
+//!      (the `MeshNodeBuilder::start` path a Buzz shared compute agent uses), binding
 //!      its own local OpenAI-compatible endpoint.
 //!   3. Drive one chat completion against the CLIENT endpoint and assert it
 //!      routed through the mesh to the serve node and produced real output.
@@ -26,7 +26,8 @@
 //!     cargo run -p buzz-relay --example mesh_serve_client_smoke
 use std::time::Duration;
 
-use mesh_llm_sdk::{client, serve, MeshDiscoveryMode};
+use mesh_llm_sdk::embedded_node::EmbeddedMeshDiscoveryMode;
+use mesh_llm_sdk::MeshNode;
 
 /// Small, real instruct model the mesh project itself uses for CI smoke.
 /// Downloaded on first run; ~100MB.
@@ -42,11 +43,11 @@ async fn main() -> anyhow::Result<()> {
     let model = std::env::var("MESH_SMOKE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     eprintln!("[smoke] model: {model}");
     let cache = mesh_llm_sdk::native_runtime::native_runtime_cache(None)?;
-    let current = mesh_llm_sdk::native_runtime::CURRENT_MESH_VERSION;
+    let current = mesh_llm_sdk::native_runtime::current_runtime_release();
     if !cache
         .installed()?
         .iter()
-        .any(|runtime| runtime.mesh_version == current)
+        .any(|runtime| runtime.release_version == current)
     {
         anyhow::bail!("MeshLLM native runtime for MeshLLM {current} is not installed; run `just mesh-e2e-hardware` to prepare it");
     }
@@ -55,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("MeshLLM host runtime init failed: {error}"))?;
     eprintln!("[smoke] MeshLLM host runtime initialized");
 
-    let serve_cfg = serve::EmbeddedServeConfig::builder()
+    let serve_cfg = MeshNode::builder()
+        .serve()
         .model(&model)
         .api_port(SERVE_API_PORT)
         .console_port(SERVE_CONSOLE_PORT)
@@ -63,15 +65,14 @@ async fn main() -> anyhow::Result<()> {
         // discovery local — no relay, no Nostr.
         .publish(true)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         // console_ui(true) is required for readiness polling at rev bd16da4
-        // (serve::start polls :console_port/api/status, which only binds when
+        // (MeshNodeBuilder::start polls :console_port/api/status, which only binds when
         // !headless). See mesh_serve_smoke.rs for the full note.
-        .console_ui(true)
-        .build();
+        .console_ui(true);
 
     eprintln!("[smoke] starting serve node...");
-    let serve_node = serve::start(serve_cfg).await?;
+    let serve_node = serve_cfg.start().await?;
     let serve_base = serve_node.api_base_url().to_string();
     eprintln!("[smoke] serve up, api_base_url = {serve_base}");
 
@@ -87,18 +88,18 @@ async fn main() -> anyhow::Result<()> {
     let serve_model_id = wait_for_model(&http, &serve_base).await?;
     eprintln!("[smoke] serve model ready: {serve_model_id}");
 
-    let client_cfg = client::EmbeddedClientConfig::builder()
+    let client_cfg = MeshNode::builder()
+        .client()
         .api_port(CLIENT_API_PORT)
         .console_port(CLIENT_CONSOLE_PORT)
         .publish(false)
         .auto_join(false)
-        .discovery_mode(MeshDiscoveryMode::Mdns)
+        .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
         .join_token(&invite)
-        .console_ui(true)
-        .build();
+        .console_ui(true);
 
     eprintln!("[smoke] starting client node joined to serve...");
-    let client_node = client::start(client_cfg).await?;
+    let client_node = client_cfg.start().await?;
     let client_base = client_node.api_base_url().to_string();
     eprintln!("[smoke] client up, api_base_url = {client_base}");
 
